@@ -31,10 +31,11 @@ jobs:
       - name: Build CHMSETUP Installer via CE-Programming/app_tools
         run: |
           git clone --depth 1 https://github.com/CE-Programming/app_tools.git /tmp/app_tools
-          sed -i 's/APPVAR_PREFIX.*/APPVAR_PREFIX = "PLXI"/' /tmp/app_tools/installer/Makefile
-          sed -i 's/NAME.*/NAME = CHMSETUP/' /tmp/app_tools/installer/Makefile
+          MF="$(find /tmp/app_tools/installer -maxdepth 1 -iname makefile | head -n 1)"
+          sed -i 's/APPVAR_PREFIX.*/APPVAR_PREFIX = "PLXI"/' "$MF"
+          sed -i 's/^NAME.*/NAME = CHMSETUP/' "$MF"
           make -C /tmp/app_tools/installer CEDEV="$CEDEV"
-          cp /tmp/app_tools/installer/bin/CHMSETUP.8xp release/
+          cp /tmp/app_tools/installer/bin/*.8xp release/
 
       - name: Upload Flash App Installer Files
         uses: actions/upload-artifact@v4
