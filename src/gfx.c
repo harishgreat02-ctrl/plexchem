@@ -251,3 +251,23 @@ void ui_draw_pill(int x, int y, const char *label, uint8_t bg, uint8_t ramp) {
     gfx_fill_rrect(x, y, w, 15, 3, bg);
     gfx_draw_text(x + 5, y + 1, &FONT_UI_11B, label, ramp);
 }
+
+void ui_draw_softkeys(const char *k0, const char *k1, const char *k2, const char *k3, const char *k4, int active_idx) {
+    const char *labels[5] = { k0, k1, k2, k3, k4 };
+const int y0 = LCD_H - 21;
+gfx_fill_rect(0, y0, LCD_W, 21, COL_CHROME);
+gfx_hline(0, y0, LCD_W, COL_BORDER);
+for (int i = 0; i < 5; i++) {
+int x0 = i * 64;
+if (labels[i] && labels[i][0]) {
+if (i == active_idx) {
+gfx_hline(x0 + 6, y0 + 1, 52, COL_ACCENT);
+gfx_hline(x0 + 6, y0 + 2, 52, COL_ACCENT);
+gfx_draw_text_center(x0 + 32, y0 + 5, &FONT_UI_11B, labels[i], RAMP_ACCENT_WHITE);
+} else {
+gfx_draw_text_center(x0 + 32, y0 + 5, &FONT_UI_11, labels[i], RAMP_INK_CHROME);
+}
+}
+if (i > 0) gfx_vline(x0, y0 + 5, 11, COL_BORDER);
+}
+}
