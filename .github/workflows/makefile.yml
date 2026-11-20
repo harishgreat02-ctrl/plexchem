@@ -32,8 +32,7 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/CE-Programming/app_tools.git /tmp/app_tools
           MF="$(find /tmp/app_tools/installer -maxdepth 1 -iname makefile | head -n 1)"
-          sed -i 's/APPVAR_PREFIX.*/APPVAR_PREFIX = "PLXI"/' "$MF"
-          sed -i 's/^NAME.*/NAME = CHMSETUP/' "$MF"
+          python3 -c 'import re, sys; p=sys.argv[1]; s=open(p).read(); s=re.sub(r"(APPVAR_PREFIX\s*=\s*\\?\")[^\"]+(\\?\")", r"\1PLXI\2", s); s=re.sub(r"^NAME\s*:?=.*", "NAME = CHMSETUP", s, flags=re.M); open(p,"w").write(s)' "$MF"
           make -C /tmp/app_tools/installer CEDEV="$CEDEV"
           cp /tmp/app_tools/installer/bin/*.8xp release/
 
