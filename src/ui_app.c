@@ -242,41 +242,47 @@ void app_init_defaults(AppState *app) {
  * ============================================================================ */
 static void render_home(const AppState *app) {
     static const char * const TITLES[6] = {
-        "Reaction Rates", "Initial Rates", "Integrated",
-        "Mechanisms",     "Arrhenius",     "Chart 12.6"
+        "Rates",        "Init. Rates", "Integrated",
+        "Mechanisms",   "Arrhenius",   "Chart 12.6"
     };
     static const char * const SUBS[6] = {
-        "Avg, Stoich & k", "Table 1-3R Solver", "Plots, k & t1/2",
-        "Slow & Interm.",  "Ea, T & Catalyst",  "Order Quick Ref"
+        "Avg & Stoich", "Order Table", "Plots & t1/2",
+        "Slow & Int.",  "Ea & Curve",  "All Formulas"
     };
 
-    ui_draw_topbar("PlexChem", "AP CHEM " SYM_DOT " CH. 12");
+    ui_draw_topbar("PlexChem", "CH. 12 KINETICS");
 
     for (int i = 0; i < 6; i++) {
         int col = i % 3;
         int row = i / 3;
         int x = 10 + col * 102;
-        int y = 30 + row * 80;
-        int w = 96, h = 72;
+        int y = 28 + row * 82;
+        int w = 96, h = 74;
         bool sel = (app->home_sel == i);
 
         gfx_fill_rrect(x, y, w, h, 4, sel ? COL_BLUE_BG : COL_WHITE);
         gfx_draw_rrect(x, y, w, h, 4, sel ? COL_ACCENT : COL_BORDER);
-        if (sel) gfx_draw_rrect(x + 1, y + 1, w - 2, h - 2, 3, COL_ACCENT);
+        if (sel) {
+            gfx_draw_rrect(x + 1, y + 1, w - 2, h - 2, 3, COL_ACCENT);
+        }
 
-        /* Centered minimalist icon badge */
-        gfx_draw_icon(x + (w - 18) / 2, y + 11, (uint8_t)i,
+        char nb[4] = { (char)('1' + i), '\0', 0, 0 };
+        gfx_fill_rrect(x + 6, y + 6, 15, 14, 2, sel ? COL_ACCENT : COL_GRAY_BG);
+        gfx_draw_text_center(x + 13, y + 6, &FONT_UI_11B, nb,
+                             sel ? RAMP_WHITE_ACCENT : RAMP_MUTED_WHITE);
+
+        gfx_draw_icon(x + (w - 18) / 2 + 4, y + 10, (uint8_t)i,
                       sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
 
-        gfx_draw_text_center(x + w / 2, y + 35, &FONT_UI_11B, TITLES[i],
+        gfx_draw_text_center(x + w / 2, y + 34, &FONT_UI_13B, TITLES[i],
                              sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-        gfx_draw_text_center(x + w / 2, y + 51, &FONT_UI_11, SUBS[i],
-                             sel ? RAMP_MUTED_BLUE : RAMP_MUTED_WHITE);
+        gfx_draw_text_center(x + w / 2, y + 53, &FONT_UI_11, SUBS[i],
+                             sel ? RAMP_INK_BLUE : RAMP_MUTED_WHITE);
     }
 
-    ui_draw_keycap(12, 196, "ENTER", "open module");
-    ui_draw_keycap(142, 196, "1-6", "jump");
-    ui_draw_keycap(214, 196, "CLEAR", "exit");
+    ui_draw_keycap(10, 196, "ENTER", "open");
+    ui_draw_keycap(106, 196, "1-6", "quick");
+    ui_draw_keycap(196, 196, "CLEAR", "quit");
     ui_draw_bottom_tabs(-1);
 }
 
