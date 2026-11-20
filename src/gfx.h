@@ -68,6 +68,7 @@ void gfx_draw_icon(int x, int y, uint8_t icon_id, uint8_t ramp);
 /* Shared PlexMath Chrome Components */
 void ui_draw_topbar(const char *left_title, const char *right_status);
 void ui_draw_bottom_tabs(int active_tab);
+void ui_draw_softkeys(const char *k0, const char *k1, const char *k2, const char *k3, const char *k4, int active_idx);
 void ui_draw_keycap(int x, int y, const char *key_label, const char *desc);
 void ui_draw_pill(int x, int y, const char *label, uint8_t bg, uint8_t ramp);
 
