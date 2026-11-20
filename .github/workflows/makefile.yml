@@ -1,11 +1,11 @@
-name: Build PlexChem TI-84 Plus CE
+name: Build PlexChem TI-84 Plus CE Flash App
 
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  build-ce:
+  build-app:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,11 +22,22 @@ jobs:
           echo "$CEDEV_DIR/bin" >> "$GITHUB_PATH"
           echo "CEDEV=$CEDEV_DIR" >> "$GITHUB_ENV"
 
-      - name: Build PLEXCHEM.8xp
-        run: make CEDEV="$CEDEV"
+      - name: Build PLEXCHEM Flash App (.8ek) & Split AppVars
+        run: |
+          make CEDEV="$CEDEV" APPLICATION=YES
+          mkdir -p release
+          convbin --iformat 8ek --input bin/PLEXCHEM.8ek --oformat 8xv-split --maxvarsize 65200 --output release/PLXI.8xv --name PLXI
 
-      - name: Upload PLEXCHEM.8xp
+      - name: Build CHMSETUP Installer via CE-Programming/app_tools
+        run: |
+          git clone --depth 1 https://github.com/CE-Programming/app_tools.git /tmp/app_tools
+          sed -i 's/APPVAR_PREFIX.*/APPVAR_PREFIX = "PLXI"/' /tmp/app_tools/installer/Makefile
+          sed -i 's/NAME.*/NAME = CHMSETUP/' /tmp/app_tools/installer/Makefile
+          make -C /tmp/app_tools/installer CEDEV="$CEDEV"
+          cp /tmp/app_tools/installer/bin/CHMSETUP.8xp release/
+
+      - name: Upload Flash App Installer Files
         uses: actions/upload-artifact@v4
         with:
-          name: PlexChem-TI84CE
-          path: bin/*.8xp
+          name: PlexChem-APPS-Installer
+          path: release/*
