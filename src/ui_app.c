@@ -1,4 +1,5 @@
 #include "ui_app.h"
+#include "theory_data.h"
 #include "hal.h"
 #include "gfx.h"
 #include "math_render.h"
@@ -7,52 +8,9 @@
 #include <string.h>
 #include <math.h>
 
-static bool ui_edit_double(const char *prompt, double *val) {
-    char buf[24];
-    fmt_compact(*val, buf, sizeof(buf));
-    int len = (int)strlen(buf);
-    bool first_key = true;
-
-    for (;;) {
-        gfx_fill_rrect(32, 74, 256, 90, 4, COL_WHITE);
-        gfx_draw_rrect(32, 74, 256, 90, 4, COL_ACCENT);
-        gfx_fill_rect(33, 75, 254, 22, COL_BLUE_BG);
-        gfx_draw_text(42, 79, &FONT_UI_11B, prompt, RAMP_ACCENT_BLUE);
-
-        gfx_fill_rrect(44, 105, 232, 26, 3, COL_GRAY_BG);
-        gfx_draw_rrect(44, 105, 232, 26, 3, COL_BORDER);
-        int tw = gfx_draw_text(52, 111, &FONT_UI_13B, buf, RAMP_INK_GRAY);
-        gfx_vline(52 + tw + 2, 110, 16, COL_ACCENT);
-
-        ui_draw_keycap(44, 140, "ENTER", "save");
-        ui_draw_keycap(126, 140, ",", "e(10^x)");
-        ui_draw_keycap(214, 140, "CLR", "back");
-        hal_swap_buffers();
-
-        KeyCode k = hal_wait_key();
-        if (k == KEY_CLEAR || k == KEY_QUIT) return false;
-        if (k == KEY_ENTER) {
-            if (len > 0) *val = strtod(buf, NULL);
-            return true;
-        }
-        if (k == KEY_DEL) {
-            first_key = false;
-            if (len > 0) buf[--len] = '\0';
-            continue;
-        }
-        char ch = 0;
-        if (k >= KEY_0 && k <= KEY_9) ch = (char)('0' + (k - KEY_0));
-        else if (k == KEY_DOT) ch = '.';
-        else if (k == KEY_NEG || k == KEY_MINUS) ch = '-';
-        else if (k == KEY_EE) ch = 'e';
-
-        if (ch != 0) {
-            if (first_key) { len = 0; buf[0] = '\0'; first_key = false; }
-            if (len < 20) { buf[len++] = ch; buf[len] = '\0'; }
-        }
-    }
-}
-
+/* ============================================================================
+ * Species Pool for Custom Mechanism Builder (Zero Popup — Inline Editing!)
+ * ============================================================================ */
 static const char * const SPECIES_POOL[] = {
     "--", "A", "B", "C", "D", "I1", "I2", "Cat",
     "NO", "NO2", "NO3", "Cl2", "Cl", "NOCl", "NOCl2",
@@ -67,85 +25,140 @@ static int find_pool_idx(const char *name) {
     return 1;
 }
 
-static void ui_edit_mech_step(MechStep *st, int step_num) {
-    int r_id[2] = { 0, 0 }, r_co[2] = { 1, 1 };
-    int p_id[2] = { 0, 0 }, p_co[2] = { 1, 1 };
-    if (st->n_react >= 1) { r_id[0] = find_pool_idx(st->react[0].formula); r_co[0] = st->react[0].coeff; }
-    if (st->n_react >= 2) { r_id[1] = find_pool_idx(st->react[1].formula); r_co[1] = st->react[1].coeff; }
-    if (st->n_prod >= 1)  { p_id[0] = find_pool_idx(st->prod[0].formula);  p_co[0] = st->prod[0].coeff; }
-    if (st->n_prod >= 2)  { p_id[1] = find_pool_idx(st->prod[1].formula);  p_co[1] = st->prod[1].coeff; }
-
-    int row = 0;
-    for (;;) {
-        gfx_fill_rrect(20, 34, 280, 174, 4, COL_WHITE);
-        gfx_draw_rrect(20, 34, 280, 174, 4, COL_ACCENT);
-        gfx_fill_rect(21, 35, 278, 22, COL_BLUE_BG);
-        char hdr[64]; snprintf(hdr, sizeof(hdr), "Edit Step %d  (L/R species, +/- coeff)", step_num + 1);
-        gfx_draw_text(28, 39, &FONT_UI_11B, hdr, RAMP_ACCENT_BLUE);
-
-        const char *rlab[5] = { "Reactant 1", "Reactant 2", "Product 1", "Product 2", "Step Speed" };
-        for (int i = 0; i < 5; i++) {
-            int y = 62 + i * 24;
-            bool sel = (row == i);
-            if (sel) gfx_fill_rrect(28, y, 264, 20, 3, COL_BLUE_BG);
-            gfx_draw_text(36, y + 3, &FONT_UI_11B, rlab[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-
-            char val[28];
-            if (i < 2) {
-                if (r_id[i] == 0) strcpy(val, "-- (none)");
-                else snprintf(val, sizeof(val), "%d %s", r_co[i], SPECIES_POOL[r_id[i]]);
-            } else if (i < 4) {
-                int j = i - 2;
-                if (p_id[j] == 0) strcpy(val, "-- (none)");
-                else snprintf(val, sizeof(val), "%d %s", p_co[j], SPECIES_POOL[p_id[j]]);
-            } else {
-                strcpy(val, st->speed == STEP_SLOW ? "SLOW (RDS)" : (st->speed == STEP_FAST_EQ ? "FAST EQ (" SYM_EQUIL ")" : "FAST"));
+/* ============================================================================
+ * Inline Number Editing Helpers (ZERO Popups — Type Directly in Any Field!)
+ * ============================================================================ */
+static double *get_active_field_ptr(AppState *app, bool *is_celsius_temp) {
+    *is_celsius_temp = false;
+    if (app->screen == SCR_RATES) {
+        if (app->sub_mode == 0) {
+            double *p[5] = { &app->rates.c1, &app->rates.c2, &app->rates.t1, &app->rates.t2, &app->rates.coeff };
+            return (app->cursor_r >= 0 && app->cursor_r < 5) ? p[app->cursor_r] : NULL;
+        }
+        if (app->sub_mode == 1) {
+            if (app->cursor_r >= 0 && app->cursor_r < 3) {
+                return (app->cursor_c == 0) ? &app->stoich.coeffs[app->cursor_r] : &app->stoich.known_rate;
             }
-            gfx_draw_text_right(284, y + 3, &FONT_UI_11B, val, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
         }
-
-        ui_draw_keycap(28, 186, "L/R", "pick");
-        ui_draw_keycap(98, 186, "+/-", "coeff");
-        ui_draw_keycap(180, 186, "ENTER", "save");
-        hal_swap_buffers();
-
-        KeyCode k = hal_wait_key();
-        if (k == KEY_CLEAR || k == KEY_QUIT) return;
-        if (k == KEY_UP && row > 0) row--;
-        if (k == KEY_DOWN && row < 4) row++;
-        if (k == KEY_LEFT || k == KEY_RIGHT) {
-            int d = (k == KEY_RIGHT) ? 1 : -1;
-            if (row < 2) r_id[row] = (r_id[row] + NUM_SPECIES_POOL + d) % NUM_SPECIES_POOL;
-            else if (row < 4) p_id[row - 2] = (p_id[row - 2] + NUM_SPECIES_POOL + d) % NUM_SPECIES_POOL;
-            else st->speed = (StepSpeed)(((int)st->speed + 3 + d) % 3);
-        }
-        if (k == KEY_PLUS || k == KEY_MINUS) {
-            int d = (k == KEY_PLUS) ? 1 : -1;
-            if (row < 2) { r_co[row] += d; if (r_co[row] < 1) r_co[row] = 1; if (r_co[row] > 3) r_co[row] = 3; }
-            else if (row < 4) { int j = row - 2; p_co[j] += d; if (p_co[j] < 1) p_co[j] = 1; if (p_co[j] > 3) p_co[j] = 3; }
-        }
-        if (k == KEY_ENTER) {
-            st->n_react = 0;
-            for (int i = 0; i < 2; i++) {
-                if (r_id[i] > 0) {
-                    strcpy(st->react[st->n_react].formula, SPECIES_POOL[r_id[i]]);
-                    st->react[st->n_react].coeff = r_co[i];
-                    st->n_react++;
-                }
+        if (app->sub_mode == 2) return &app->k_unit_order;
+    } else if (app->screen == SCR_INIT_RATES) {
+        if (app->sub_mode == 0) {
+            if (app->cursor_r < app->init_rates.num_rows) {
+                return (app->cursor_c < app->init_rates.num_reactants)
+                       ? &app->init_rates.conc[app->cursor_r][app->cursor_c]
+                       : &app->init_rates.rate[app->cursor_r];
             }
-            st->n_prod = 0;
-            for (int i = 0; i < 2; i++) {
-                if (p_id[i] > 0) {
-                    strcpy(st->prod[st->n_prod].formula, SPECIES_POOL[p_id[i]]);
-                    st->prod[st->n_prod].coeff = p_co[i];
-                    st->n_prod++;
-                }
-            }
-            return;
+        } else if (app->sub_mode == 1 && app->step_idx == 2) {
+            if (app->cursor_c < app->init_rates.num_reactants)
+                return &app->init_rates.pred_conc[app->cursor_c];
         }
+    } else if (app->screen == SCR_INTEGRATED) {
+        if (app->sub_mode == 1) {
+            double *p[4] = { &app->int_eq.A0, &app->int_eq.At, &app->int_eq.k, &app->int_eq.t };
+            return (app->cursor_r >= 0 && app->cursor_r < 4) ? p[app->cursor_r] : NULL;
+        }
+        if (app->sub_mode == 2 && app->cursor_r < app->int_table.num_rows) {
+            return (app->cursor_c == 0) ? &app->int_table.t[app->cursor_r] : &app->int_table.c[app->cursor_r];
+        }
+        if (app->sub_mode == 3) {
+            double *p[3] = { &app->pseudo_kp, &app->pseudo_excess, &app->pseudo_order };
+            return (app->cursor_r >= 0 && app->cursor_r < 3) ? p[app->cursor_r] : NULL;
+        }
+    } else if (app->screen == SCR_ARRHENIUS) {
+        if (app->sub_mode == 0) {
+            if (app->cursor_r == 2 || app->cursor_r == 4) *is_celsius_temp = app->arrh_celsius;
+            double *p[5] = { &app->arrh2.Ea_kj, &app->arrh2.k2, &app->arrh2.T2, &app->arrh2.k1, &app->arrh2.T1 };
+            return (app->cursor_r >= 0 && app->cursor_r < 5) ? p[app->cursor_r] : NULL;
+        }
+        if (app->sub_mode == 1) {
+            if (app->cursor_r < app->arrh_tbl.num_rows)
+                return (app->cursor_c == 0) ? &app->arrh_tbl.T[app->cursor_r] : &app->arrh_tbl.k[app->cursor_r];
+            return &app->arrh_tbl.eval_T;
+        }
+        if (app->sub_mode == 2) {
+            double *p[4] = { &app->cat.Ea_uncat_kj, &app->cat.Ea_cat_kj, &app->cat.delta_E_kj, &app->cat.T_kelvin };
+            return (app->cursor_r >= 0 && app->cursor_r < 4) ? p[app->cursor_r] : NULL;
+        }
+    }
+    return NULL;
+}
+
+static void recalc_active_screen(AppState *app) {
+    if (app->screen == SCR_RATES) {
+        if (app->sub_mode == 0) kinetics_rate_calc(&app->rates);
+        else if (app->sub_mode == 1) {
+            if (app->cursor_c == 1) app->stoich.known_idx = app->cursor_r;
+            kinetics_stoich_rates(&app->stoich);
+        }
+    } else if (app->screen == SCR_INIT_RATES) {
+        kinetics_solve_initial_rates(&app->init_rates);
+    } else if (app->screen == SCR_INTEGRATED) {
+        if (app->sub_mode == 1) kinetics_integrated_solve(&app->int_eq);
+        else if (app->sub_mode == 2) kinetics_regress_order(&app->int_table);
+    } else if (app->screen == SCR_ARRHENIUS) {
+        if (app->sub_mode == 0) kinetics_arrhenius_2pt(&app->arrh2);
+        else if (app->sub_mode == 1) kinetics_arrhenius_regress(&app->arrh_tbl);
+        else if (app->sub_mode == 2) kinetics_catalyst_calc(&app->cat);
     }
 }
 
+static void begin_inline_edit(AppState *app, char initial_ch) {
+    bool is_c = false;
+    double *ptr = get_active_field_ptr(app, &is_c);
+    if (!ptr) return;
+    app->editing = true;
+    if (initial_ch != 0) {
+        app->edit_buf[0] = initial_ch;
+        app->edit_buf[1] = '\0';
+        app->edit_len = 1;
+        app->edit_first_key = false;
+    } else {
+        double v = is_c ? (*ptr - 273.15) : *ptr;
+        fmt_compact(v, app->edit_buf, sizeof(app->edit_buf));
+        app->edit_len = (int)strlen(app->edit_buf);
+        app->edit_first_key = true;
+    }
+}
+
+static void commit_inline_edit(AppState *app) {
+    bool is_c = false;
+    double *ptr = get_active_field_ptr(app, &is_c);
+    if (ptr && app->edit_len > 0) {
+        double v = strtod(app->edit_buf, NULL);
+        *ptr = is_c ? (v + 273.15) : v;
+        recalc_active_screen(app);
+    }
+    app->editing = false;
+}
+
+static char key_to_numchar(KeyCode k) {
+    if (k >= KEY_0 && k <= KEY_9) return (char)('0' + (k - KEY_0));
+    if (k == KEY_DOT) return '.';
+    if (k == KEY_NEG) return '-';
+    if (k == KEY_EE)  return 'e';
+    return 0;
+}
+
+static void draw_inline_value(int right_x, int y, double val, bool is_editing,
+                              const AppState *app, uint8_t normal_ramp) {
+    if (is_editing) {
+        int tw = gfx_text_width(&FONT_UI_11B, app->edit_buf);
+        int bw = tw + 14;
+        if (bw < 44) bw = 44;
+        gfx_fill_rrect(right_x - bw, y - 1, bw, 16, 2, COL_WHITE);
+        gfx_draw_rrect(right_x - bw, y - 1, bw, 16, 2, COL_ACCENT);
+        gfx_draw_text(right_x - bw + 5, y, &FONT_UI_11B, app->edit_buf, RAMP_ACCENT_WHITE);
+        gfx_vline(right_x - bw + 5 + tw + 1, y + 1, 12, COL_ACCENT);
+    } else {
+        char vb[24];
+        fmt_compact(val, vb, sizeof(vb));
+        gfx_draw_text_right(right_x, y, &FONT_UI_11B, vb, normal_ramp);
+    }
+}
+
+/* ============================================================================
+ * Default Initialization
+ * ============================================================================ */
 void app_load_mech_preset(AppState *app, int idx) {
     app->mech_preset = idx % 5;
     MechState *m = &app->mech;
@@ -243,6 +256,7 @@ void app_load_mech_preset(AppState *app, int idx) {
 void app_init_defaults(AppState *app) {
     memset(app, 0, sizeof(*app));
     app->screen = SCR_HOME;
+    app->theory_list = true;
     app->k_unit_order = 2.0;
     app->pseudo_kp = 0.12;
     app->pseudo_excess = 3.0;
@@ -312,58 +326,62 @@ void app_init_defaults(AppState *app) {
     kinetics_catalyst_calc(&app->cat);
 }
 
+/* ============================================================================
+ * Screen 0: Brand-New Row-Based Home Menu (ZERO Icons, ZERO Tiles!)
+ * ============================================================================ */
 static void render_home(const AppState *app) {
-    static const char * const TITLES[6] = {
-        "Rates",        "Init. Rates", "Integrated",
-        "Mechanisms",   "Arrhenius",   "Ref & Graphs"
+    static const char * const TITLES[7] = {
+        "Reaction Rates",
+        "Initial Rates Table",
+        "Integrated & Plots",
+        "Mechanisms Builder",
+        "Arrhenius & Energy",
+        "Chart 12.6 & Graphs",
+        "Theories & FRQ Guide"
     };
-    static const char * const SUBS[6] = {
-        "Avg, Stoich, k", "Order Table", "Plots & t1/2",
-        "Custom Steps",   "Ea, T & Cat", "5 Test Guides"
+    static const char * const DESCS[7] = {
+        "Avg, Stoich & k Units",
+        "Orders, k & Steps",
+        "Graphs, t1/2 & Pseudo",
+        "Custom Steps & RDS",
+        "2-Pt, ln(k) & Catalysts",
+        "Master Ref & Curves",
+        "12 Topics: Def/How/Ex"
     };
 
-    ui_draw_topbar("PlexChem", "CH. 12 KINETICS");
+    ui_draw_topbar("PlexChem  Ch. 12", "PRESS 1-7 OR ENTER");
 
-    for (int i = 0; i < 6; i++) {
-        int col = i % 3;
-        int row = i / 3;
-        int x = 10 + col * 102;
-        int y = 28 + row * 82;
-        int w = 96, h = 74;
+    for (int i = 0; i < 7; i++) {
+        int y = 25 + i * 27;
         bool sel = (app->home_sel == i);
+        if (sel) {
+            gfx_fill_rrect(8, y, 304, 24, 3, COL_BLUE_BG);
+            gfx_fill_rect(8, y + 3, 3, 18, COL_ACCENT);
+        } else {
+            gfx_hline(14, y + 25, 292, COL_GRID);
+        }
+        char nb[4]; snprintf(nb, sizeof(nb), "%d", i + 1);
+        gfx_fill_rrect(16, y + 5, 16, 14, 2, sel ? COL_ACCENT : COL_GRAY_BG);
+        gfx_draw_text_center(24, y + 5, &FONT_UI_11B, nb, sel ? RAMP_WHITE_ACCENT : RAMP_MUTED_WHITE);
 
-        gfx_fill_rrect(x, y, w, h, 4, sel ? COL_BLUE_BG : COL_WHITE);
-        gfx_draw_rrect(x, y, w, h, 4, sel ? COL_ACCENT : COL_BORDER);
-        if (sel) gfx_draw_rrect(x + 1, y + 1, w - 2, h - 2, 3, COL_ACCENT);
-
-        char nb[2] = { (char)('1' + i), '\0' };
-        gfx_fill_rrect(x + 6, y + 6, 15, 14, 2, sel ? COL_ACCENT : COL_GRAY_BG);
-        gfx_draw_text_center(x + 13, y + 6, &FONT_UI_11B, nb,
-                             sel ? RAMP_WHITE_ACCENT : RAMP_MUTED_WHITE);
-
-        gfx_draw_icon(x + (w - 18) / 2 + 4, y + 10, (uint8_t)i,
-                      sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-
-        gfx_draw_text_center(x + w / 2, y + 34, &FONT_UI_13B, TITLES[i],
-                             sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-        gfx_draw_text_center(x + w / 2, y + 53, &FONT_UI_11, SUBS[i],
-                             sel ? RAMP_INK_BLUE : RAMP_MUTED_WHITE);
+        gfx_draw_text(38, y + 5, &FONT_UI_11B, TITLES[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+        gfx_draw_text_right(304, y + 5, &FONT_UI_11, DESCS[i], sel ? RAMP_INK_BLUE : RAMP_MUTED_WHITE);
     }
 
-    ui_draw_keycap(10, 196, "ENTER", "open");
-    ui_draw_keycap(106, 196, "1-6", "quick");
-    ui_draw_keycap(196, 196, "CLEAR", "quit");
-    ui_draw_bottom_tabs(-1);
+    ui_draw_softkeys("Open", "Rates", "Table", "Graphs", "Theory", 0);
 }
 
+/* ============================================================================
+ * Screen 1: Reaction Rates (Avg | Stoich | k Units) — Inline Zero-Popup!
+ * ============================================================================ */
 static void render_rates(const AppState *app) {
-    const char *mnames[3] = { "RATES " SYM_DOT " AVG", "RATES " SYM_DOT " STOICH", "RATES " SYM_DOT " k UNITS" };
-    ui_draw_topbar("PlexChem", mnames[app->sub_mode]);
+    const char *hdr[3] = { "AVG RATE", "STOICHIOMETRY", "UNITS OF k" };
+    ui_draw_topbar("Reaction Rates", hdr[app->sub_mode]);
 
     if (app->sub_mode == 0) {
         gfx_fill_rrect(10, 26, 300, 56, 4, COL_WHITE);
         gfx_draw_rrect(10, 26, 300, 56, 4, COL_BORDER);
-        math_draw_center(160, 33,
+        math_draw_center(160, 32,
                          app->rates.is_reactant
                              ? "~Rate~ = " SYM_MINUS "\\f{" SYM_DELTA "[A]}{~a~" SYM_DELTA "~t~}"
                              : "~Rate~ = +\\f{" SYM_DELTA "[C]}{~c~" SYM_DELTA "~t~}",
@@ -372,125 +390,132 @@ static void render_rates(const AppState *app) {
         char rbuf[48], eqbuf[80];
         fmt_sci_math(app->rates.overall_rate, rbuf, sizeof(rbuf), 3);
         snprintf(eqbuf, sizeof(eqbuf), "~Rate~ = %s \\f{mol}{L" SYM_DOT "s}", rbuf);
-        math_draw_center(160, 60, eqbuf, 14, RAMP_INK_WHITE, COL_INK);
+        math_draw_center(160, 60, eqbuf, 14, RAMP_ACCENT_WHITE, COL_ACCENT);
 
-        const char *labels[5] = { "[A]1 (M)", "[A]2 (M)", "t1 (s)", "t2 (s)", "Coeff a" };
+        const char *labels[5] = { "[A]1 (initial M)", "[A]2 (final M)", "t1 (initial s)", "t2 (final s)", "Coeff a" };
         double vals[5] = { app->rates.c1, app->rates.c2, app->rates.t1, app->rates.t2, app->rates.coeff };
         for (int i = 0; i < 5; i++) {
-            int y = 89 + i * 20;
+            int y = 89 + i * 22;
             bool sel = (app->cursor_r == i);
-            if (sel) gfx_fill_rrect(10, y, 300, 18, 3, COL_BLUE_BG);
-            gfx_draw_text(18, y + 2, &FONT_UI_11B, labels[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-            char vb[32]; fmt_compact(vals[i], vb, sizeof(vb));
-            gfx_draw_text_right(302, y + 2, &FONT_UI_11, vb, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
+            if (sel) gfx_fill_rrect(10, y, 300, 20, 3, COL_BLUE_BG);
+            gfx_draw_text(18, y + 3, &FONT_UI_11B, labels[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            draw_inline_value(302, y + 3, vals[i], sel && app->editing, app,
+                              sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
         }
-        ui_draw_keycap(10, 196, "ENTER", "edit");
-        ui_draw_keycap(92, 196, "MODE", "stoich/k");
-        ui_draw_keycap(204, 196, "APPS", app->rates.is_reactant ? "React" : "Prod");
+        gfx_draw_text(12, 202, &FONT_UI_11, "Type number directly + ENTER  (no popups!)", RAMP_MUTED_WHITE);
+        ui_draw_softkeys(app->rates.is_reactant ? "React" : "Prod", "Avg", "Stoich", "k Unit", "Home", 1);
     } else if (app->sub_mode == 1) {
-        char hdr[64];
-        snprintf(hdr, sizeof(hdr), "%.0fA + %.0fB " SYM_ARROW " %.0fC",
+        char eq[64];
+        snprintf(eq, sizeof(eq), "%.0fA + %.0fB " SYM_ARROW " %.0fC",
                  app->stoich.coeffs[0], app->stoich.coeffs[1], app->stoich.coeffs[2]);
-        math_draw_center(160, 27, hdr, 14, RAMP_INK_WHITE, COL_INK);
+        math_draw_center(160, 27, eq, 14, RAMP_INK_WHITE, COL_INK);
 
-        gfx_fill_rrect(10, 49, 300, 34, 4, COL_BLUE_BG);
-        gfx_draw_text(18, 54, &FONT_UI_11B, "Overall Reaction Rate", RAMP_INK_BLUE);
+        gfx_fill_rrect(10, 49, 300, 32, 4, COL_BLUE_BG);
+        gfx_draw_text(18, 57, &FONT_UI_11B, "Overall Rate:", RAMP_INK_BLUE);
         char rb[40]; fmt_sci_math(app->stoich.overall_rate, rb, sizeof(rb), 3);
         math_draw_right(302, 56, rb, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
-        gfx_draw_text(18, 68, &FONT_UI_11, "mol/(L" SYM_DOT "s)  [sign: - consumed, + formed]", RAMP_MUTED_BLUE);
 
-        const char *sp[3] = { "Species A (Reactant)", "Species B (Reactant)", "Species C (Product)" };
+        const char *sp[3] = { "A (React)", "B (React)", "C (Prod)" };
+        gfx_draw_text(18, 86, &FONT_UI_11, "Species", RAMP_MUTED_WHITE);
+        gfx_draw_text(126, 86, &FONT_UI_11, "Coeff", RAMP_MUTED_WHITE);
+        gfx_draw_text_right(302, 86, &FONT_UI_11, "Rate (mol/L" SYM_DOT "s)", RAMP_MUTED_WHITE);
+        gfx_hline(10, 100, 300, COL_BORDER);
+
         for (int i = 0; i < 3; i++) {
-            int y = 90 + i * 32;
+            int y = 105 + i * 28;
             bool sel = (app->cursor_r == i);
-            gfx_fill_rrect(10, y, 300, 28, 3, sel ? COL_BLUE_BG : COL_WHITE);
-            gfx_draw_rrect(10, y, 300, 28, 3, sel ? COL_ACCENT : COL_BORDER);
-            gfx_draw_text(18, y + 3, &FONT_UI_11B, sp[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-            char cb[32]; snprintf(cb, sizeof(cb), "coeff = %.0f", app->stoich.coeffs[i]);
-            gfx_draw_text(18, y + 15, &FONT_UI_11, cb, RAMP_MUTED_WHITE);
-            char sb[40]; fmt_sci_math(app->stoich.rates[i], sb, sizeof(sb), 3);
-            math_draw_right(302, y + 6, sb, 14, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE, COL_INK);
+            if (sel) gfx_fill_rrect(10, y, 300, 24, 3, COL_BLUE_BG);
+            gfx_draw_text(18, y + 5, &FONT_UI_11B, sp[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            draw_inline_value(162, y + 5, app->stoich.coeffs[i], sel && app->cursor_c == 0 && app->editing,
+                              app, (sel && app->cursor_c == 0) ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            draw_inline_value(302, y + 5, app->stoich.rates[i], sel && app->cursor_c == 1 && app->editing,
+                              app, (sel && app->cursor_c == 1) ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
         }
-        ui_draw_keycap(10, 196, "ENTER", "coeff");
-        ui_draw_keycap(96, 196, "APPS", "set rate");
-        ui_draw_keycap(206, 196, "MODE", "k units");
+        gfx_draw_text(12, 198, &FONT_UI_11, "L/R: Coeff vs Rate   Type any value + ENTER", RAMP_MUTED_WHITE);
+        ui_draw_softkeys("Calc", "Avg", "Stoich", "k Unit", "Home", 2);
     } else {
         gfx_fill_rrect(10, 28, 300, 82, 4, COL_BLUE_BG);
         char oline[48]; snprintf(oline, sizeof(oline), "Overall Order  ~n~ = %.2g", app->k_unit_order);
         math_draw_center(160, 36, oline, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
         char ku[48], kfull[80];
         kinetics_format_k_units(app->k_unit_order, "s", ku, sizeof(ku));
-        snprintf(kfull, sizeof(kfull), "~k~ units = %s", ku);
+        snprintf(kfull, sizeof(kfull), "~k~ = %s", ku);
         math_draw_center(160, 64, kfull, 20, RAMP_INK_BLUE, COL_INK);
 
-        gfx_fill_rrect(10, 118, 300, 70, 4, COL_WHITE);
-        gfx_draw_rrect(10, 118, 300, 70, 4, COL_BORDER);
-        gfx_draw_text(18, 124, &FONT_UI_11B, "Rule:  k = M^{1-n} / time", RAMP_INK_WHITE);
-        gfx_draw_text(18, 141, &FONT_UI_11, "n=0: mol/(L" SYM_DOT "s)   n=1: s^-1   n=2: L/(mol" SYM_DOT "s)", RAMP_MUTED_WHITE);
-        gfx_draw_text(18, 157, &FONT_UI_11, "n=3: L^2/(mol^2" SYM_DOT "s)  n=1.5: L^0.5/(mol^0.5" SYM_DOT "s)", RAMP_MUTED_WHITE);
-        gfx_draw_text(18, 172, &FONT_UI_11, "Press LEFT/RIGHT (+/-0.5) or ENTER for any n", RAMP_ACCENT_WHITE);
-
-        ui_draw_keycap(10, 196, "L/R", "+/-0.5");
-        ui_draw_keycap(96, 196, "ENTER", "custom n");
-        ui_draw_keycap(214, 196, "MODE", "avg");
+        gfx_fill_rrect(10, 118, 300, 74, 4, COL_WHITE);
+        gfx_draw_rrect(10, 118, 300, 74, 4, COL_BORDER);
+        gfx_draw_text(18, 124, &FONT_UI_11B, "Type any order n (e.g. 0, 1, 2, 1.5, -1):", RAMP_INK_WHITE);
+        draw_inline_value(298, 124, app->k_unit_order, app->editing, app, RAMP_ACCENT_WHITE);
+        gfx_draw_text(18, 144, &FONT_UI_11, "0th: mol/(L" SYM_DOT "s)   1st: s^-1   2nd: L/(mol" SYM_DOT "s)", RAMP_MUTED_WHITE);
+        gfx_draw_text(18, 160, &FONT_UI_11, "3rd: L^2/(mol^2" SYM_DOT "s)  L/R steps by +/-0.5", RAMP_MUTED_WHITE);
+        gfx_draw_text(18, 175, &FONT_UI_11, "Formula:  k units = M^(1-n) / time", RAMP_ACCENT_WHITE);
+        ui_draw_softkeys("n+0.5", "Avg", "Stoich", "k Unit", "Home", 3);
     }
-    ui_draw_bottom_tabs(0);
 }
 
+/* ============================================================================
+ * Screen 2: Initial Rates Table + Real Expanding Steps (Inline Zero-Popup!)
+ * ============================================================================ */
 static void render_init_rates(const AppState *app) {
     const InitialRatesState *ir = &app->init_rates;
     if (app->sub_mode == 0) {
-        char st[32];
-        snprintf(st, sizeof(st), "%dR " SYM_TIMES " %d ROWS", ir->num_reactants, ir->num_rows);
+        char st[32]; snprintf(st, sizeof(st), "%dR " SYM_TIMES " %d ROWS", ir->num_reactants, ir->num_rows);
         ui_draw_topbar("Initial Rates", st);
 
-        char p1[24], p2[24];
-        snprintf(p1, sizeof(p1), "React: %d", ir->num_reactants);
-        snprintf(p2, sizeof(p2), "Rows: %d", ir->num_rows);
-        ui_draw_pill(10, 25, p1, COL_BLUE_BG, RAMP_ACCENT_BLUE);
-        ui_draw_pill(90, 25, p2, COL_GRAY_BG, RAMP_INK_GRAY);
-        ui_draw_pill(168, 25, "APPS: Solve & Steps", COL_GREEN_BG, RAMP_GREEN_BG);
-
         int cols = ir->num_reactants + 1;
-        int cw = 266 / cols;
-        int y0 = 46;
+        int cw = 268 / cols;
+        int y0 = 26;
         gfx_fill_rect(10, y0, 300, 18, COL_CHROME);
         gfx_draw_rect(10, y0, 300, 18, COL_BORDER);
         gfx_draw_text(16, y0 + 2, &FONT_UI_11B, "#", RAMP_MUTED_CHROME);
         const char *chdr[3] = { "[A]", "[B]", "[C]" };
-        for (int c = 0; c < ir->num_reactants; c++) {
-            gfx_draw_text_center(44 + c * cw + cw / 2, y0 + 2, &FONT_UI_11B, chdr[c], RAMP_INK_CHROME);
-        }
-        gfx_draw_text_center(44 + ir->num_reactants * cw + cw / 2, y0 + 2, &FONT_UI_11B, "Rate", RAMP_INK_CHROME);
+        for (int c = 0; c < ir->num_reactants; c++)
+            gfx_draw_text_center(42 + c * cw + cw / 2, y0 + 2, &FONT_UI_11B, chdr[c], RAMP_INK_CHROME);
+        gfx_draw_text_center(42 + ir->num_reactants * cw + cw / 2, y0 + 2, &FONT_UI_11B, "Rate", RAMP_INK_CHROME);
 
         int vis = ir->num_rows < 6 ? ir->num_rows : 6;
         int start_r = (app->cursor_r >= vis) ? (app->cursor_r - vis + 1) : 0;
         for (int vi = 0; vi < vis; vi++) {
             int r = start_r + vi;
-            int ry = y0 + 18 + vi * 20;
-            gfx_draw_rect(10, ry, 300, 20, COL_BORDER);
+            int ry = y0 + 18 + vi * 22;
+            gfx_draw_rect(10, ry, 300, 22, COL_BORDER);
             char rb[16]; snprintf(rb, sizeof(rb), "%d", r + 1);
-            gfx_draw_text(16, ry + 3, &FONT_UI_11, rb, RAMP_MUTED_WHITE);
+            gfx_draw_text(16, ry + 4, &FONT_UI_11, rb, RAMP_MUTED_WHITE);
 
             for (int c = 0; c < cols; c++) {
-                int cx = 44 + c * cw;
+                int cx = 42 + c * cw;
                 bool sel = (app->cursor_r == r && app->cursor_c == c);
                 if (sel) {
-                    gfx_fill_rect(cx + 1, ry + 1, cw - 2, 18, COL_BLUE_BG);
-                    gfx_draw_rect(cx, ry, cw, 20, COL_ACCENT);
+                    gfx_fill_rect(cx + 1, ry + 1, cw - 2, 20, app->editing ? COL_WHITE : COL_BLUE_BG);
+                    gfx_draw_rect(cx, ry, cw, 22, COL_ACCENT);
                 }
-                double v = (c < ir->num_reactants) ? ir->conc[r][c] : ir->rate[r];
-                char vb[16]; fmt_compact(v, vb, sizeof(vb));
-                gfx_draw_text_center(cx + cw / 2, ry + 3, &FONT_UI_11, vb,
-                                     sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+                if (sel && app->editing) {
+                    int tw = gfx_draw_text(cx + 4, ry + 4, &FONT_UI_11B, app->edit_buf, RAMP_ACCENT_WHITE);
+                    gfx_vline(cx + 4 + tw + 1, ry + 4, 13, COL_ACCENT);
+                } else {
+                    double v = (c < ir->num_reactants) ? ir->conc[r][c] : ir->rate[r];
+                    char vb[16]; fmt_compact(v, vb, sizeof(vb));
+                    gfx_draw_text_center(cx + cw / 2, ry + 4, &FONT_UI_11, vb,
+                                         sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+                }
             }
         }
-        ui_draw_keycap(10, 196, "ENTER", "edit");
-        ui_draw_keycap(92, 196, "+/-", "rows");
-        ui_draw_keycap(166, 196, "MODE", "react#");
+        /* Live solved summary strip right below table */
+        gfx_fill_rrect(10, 180, 300, 34, 3, COL_BLUE_BG);
+        char sline[112], kb[32];
+        fmt_sci_math(ir->k_mean, kb, sizeof(kb), 3);
+        if (ir->num_reactants == 1)
+            snprintf(sline, sizeof(sline), "~n~=%.2g   ~k~ = %s", ir->order[0], kb);
+        else if (ir->num_reactants == 2)
+            snprintf(sline, sizeof(sline), "~n~=%.2g, ~m~=%.2g   ~k~ = %s", ir->order[0], ir->order[1], kb);
+        else
+            snprintf(sline, sizeof(sline), "~n~=%.2g, ~m~=%.2g, ~p~=%.2g   ~k~ = %s", ir->order[0], ir->order[1], ir->order[2], kb);
+        math_draw_center(160, 189, sline, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
+
+        ui_draw_softkeys("Steps", "+Row", "-Row", "1/2/3R", "Home", -1);
     } else {
-        char st[24]; snprintf(st, sizeof(st), "STEPS %d / 3", app->step_idx + 1);
-        ui_draw_topbar("PlexChem", st);
+        char st[24]; snprintf(st, sizeof(st), "STEP %d / 3", app->step_idx + 1);
+        ui_draw_topbar("Initial Rates Steps", st);
 
         char rl[96] = "~Rate~ = ~k~";
         const char *rn[3] = { "A", "B", "C" };
@@ -506,88 +531,85 @@ static void render_init_rates(const AppState *app) {
             } else snprintf(t, sizeof(t), "[%s]^{%.1f}", rn[j], o);
             strncat(rl, t, sizeof(rl) - strlen(rl) - 1);
         }
-        math_draw_center(160, 25, rl, 20, RAMP_INK_WHITE, COL_INK);
+        math_draw_center(160, 26, rl, 20, RAMP_INK_WHITE, COL_INK);
 
-        int cur_y = 54;
+        int cur_y = 56;
         for (int s = 0; s < 3; s++) {
             bool act = (app->step_idx == s);
             if (act) {
-                gfx_fill_rrect(8, cur_y, 304, 66, 4, COL_BLUE_BG);
+                gfx_fill_rrect(8, cur_y, 304, 72, 4, COL_BLUE_BG);
                 char tag[12]; snprintf(tag, sizeof(tag), "STEP %d", s + 1);
                 gfx_draw_text_right(304, cur_y + 5, &FONT_UI_11B, tag, RAMP_ACCENT_BLUE);
-
                 if (s == 0) {
                     gfx_draw_text(16, cur_y + 5, &FONT_UI_11B, "Find reactant orders (log ratio)", RAMP_INK_BLUE);
                     char sub[96];
-                    snprintf(sub, sizeof(sub), "Compare trials (%d,%d) " SYM_ARROW " Overall = %.2g",
+                    snprintf(sub, sizeof(sub), "Trials (%d,%d) " SYM_ARROW " Overall order = %.2g",
                              ir->pair_r1[0] + 1, ir->pair_r2[0] + 1, ir->overall_order);
-                    gfx_draw_text(16, cur_y + 19, &FONT_UI_11, sub, RAMP_MUTED_BLUE);
+                    gfx_draw_text(16, cur_y + 21, &FONT_UI_11, sub, RAMP_MUTED_BLUE);
                     char om[80];
-                    if (ir->num_reactants == 1)
-                        snprintf(om, sizeof(om), "~n~_{A} = %.2g   (~raw~ %.2f)", ir->order[0], ir->raw_order[0]);
-                    else if (ir->num_reactants == 2)
-                        snprintf(om, sizeof(om), "~n~_{A} = %.2g,  ~m~_{B} = %.2g,  ~n~+~m~ = %.2g",
-                                 ir->order[0], ir->order[1], ir->overall_order);
-                    else
-                        snprintf(om, sizeof(om), "~n~=%.2g, ~m~=%.2g, ~p~=%.2g (Total %.2g)",
-                                 ir->order[0], ir->order[1], ir->order[2], ir->overall_order);
-                    math_draw_center(160, cur_y + 40, om, 14, RAMP_INK_BLUE, COL_INK);
+                    if (ir->num_reactants == 1) snprintf(om, sizeof(om), "~n~_{A} = %.2g  (raw %.2f)", ir->order[0], ir->raw_order[0]);
+                    else if (ir->num_reactants == 2) snprintf(om, sizeof(om), "~n~_{A} = %.2g,  ~m~_{B} = %.2g,  ~n~+~m~ = %.2g", ir->order[0], ir->order[1], ir->overall_order);
+                    else snprintf(om, sizeof(om), "~n~=%.2g, ~m~=%.2g, ~p~=%.2g (Sum %.2g)", ir->order[0], ir->order[1], ir->order[2], ir->overall_order);
+                    math_draw_center(160, cur_y + 44, om, 14, RAMP_INK_BLUE, COL_INK);
                 } else if (s == 1) {
-                    gfx_draw_text(16, cur_y + 5, &FONT_UI_11B, "Solve rate constant k (mean)", RAMP_INK_BLUE);
+                    gfx_draw_text(16, cur_y + 5, &FONT_UI_11B, "Solve mean rate constant k", RAMP_INK_BLUE);
                     char sub[80];
-                    snprintf(sub, sizeof(sub), "Trial 1 k=%.3g, Trial 2 k=%.3g", ir->k_trial[0], ir->k_trial[1]);
-                    gfx_draw_text(16, cur_y + 19, &FONT_UI_11, sub, RAMP_MUTED_BLUE);
+                    snprintf(sub, sizeof(sub), "Trial 1 k=%.3g,  Trial 2 k=%.3g", ir->k_trial[0], ir->k_trial[1]);
+                    gfx_draw_text(16, cur_y + 21, &FONT_UI_11, sub, RAMP_MUTED_BLUE);
                     char kb[40], ku[40], kl[90];
                     fmt_sci_math(ir->k_mean, kb, sizeof(kb), 3);
                     kinetics_format_k_units(ir->overall_order, "s", ku, sizeof(ku));
                     snprintf(kl, sizeof(kl), "~k~ = %s %s", kb, ku);
-                    math_draw_center(160, cur_y + 39, kl, 14, RAMP_INK_BLUE, COL_INK);
+                    math_draw_center(160, cur_y + 42, kl, 14, RAMP_INK_BLUE, COL_INK);
                 } else {
-                    gfx_draw_text(16, cur_y + 5, &FONT_UI_11B, "Predict rate (ENTER to edit [ ])", RAMP_INK_BLUE);
-                    char sub[80];
-                    if (ir->num_reactants == 1) snprintf(sub, sizeof(sub), "At [A]=%.3g M", ir->pred_conc[0]);
-                    else if (ir->num_reactants == 2) snprintf(sub, sizeof(sub), "At [A]=%.3g, [B]=%.3g M", ir->pred_conc[0], ir->pred_conc[1]);
-                    else snprintf(sub, sizeof(sub), "At [A]=%.2g, [B]=%.2g, [C]=%.2g", ir->pred_conc[0], ir->pred_conc[1], ir->pred_conc[2]);
-                    gfx_draw_text(16, cur_y + 19, &FONT_UI_11, sub, RAMP_MUTED_BLUE);
+                    gfx_draw_text(16, cur_y + 5, &FONT_UI_11B, "Predict Rate (L/R pick, type #)", RAMP_INK_BLUE);
+                    /* Inline editable prediction concentrations! */
+                    for (int j = 0; j < ir->num_reactants; j++) {
+                        int px = 16 + j * 96;
+                        char lb[16]; snprintf(lb, sizeof(lb), "[%s]:", rn[j]);
+                        gfx_draw_text(px, cur_y + 22, &FONT_UI_11, lb, (app->cursor_c == j) ? RAMP_ACCENT_BLUE : RAMP_MUTED_BLUE);
+                        draw_inline_value(px + 86, cur_y + 22, ir->pred_conc[j],
+                                          (app->cursor_c == j) && app->editing, app,
+                                          (app->cursor_c == j) ? RAMP_ACCENT_BLUE : RAMP_INK_BLUE);
+                    }
                     char pb[40], pl[72];
                     fmt_sci_math(ir->pred_rate, pb, sizeof(pb), 3);
                     snprintf(pl, sizeof(pl), "~Rate~ = %s \\f{mol}{L" SYM_DOT "s}", pb);
-                    math_draw_center(160, cur_y + 39, pl, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
+                    math_draw_center(160, cur_y + 45, pl, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
                 }
-                cur_y += 70;
+                cur_y += 76;
             } else {
                 char nb[4]; snprintf(nb, sizeof(nb), "%d", s + 1);
-                gfx_draw_text(12, cur_y + 6, &FONT_UI_11, nb, RAMP_MUTED_WHITE);
+                gfx_draw_text(12, cur_y + 7, &FONT_UI_11, nb, RAMP_MUTED_WHITE);
                 if (s == 0) {
-                    gfx_draw_text(24, cur_y + 6, &FONT_UI_11B, "Reactant orders", RAMP_INK_WHITE);
+                    gfx_draw_text(24, cur_y + 7, &FONT_UI_11B, "Reactant orders", RAMP_INK_WHITE);
                     char ov[32]; snprintf(ov, sizeof(ov), "Overall = %.2g", ir->overall_order);
-                    gfx_draw_text_right(304, cur_y + 6, &FONT_UI_11, ov, RAMP_MUTED_WHITE);
+                    gfx_draw_text_right(304, cur_y + 7, &FONT_UI_11, ov, RAMP_MUTED_WHITE);
                 } else if (s == 1) {
-                    gfx_draw_text(24, cur_y + 6, &FONT_UI_11B, "Mean rate constant", RAMP_INK_WHITE);
+                    gfx_draw_text(24, cur_y + 7, &FONT_UI_11B, "Mean rate constant", RAMP_INK_WHITE);
                     char kb[40]; fmt_sci_math(ir->k_mean, kb, sizeof(kb), 3);
-                    math_draw_right(304, cur_y + 5, kb, 14, RAMP_INK_WHITE, COL_INK);
+                    math_draw_right(304, cur_y + 6, kb, 14, RAMP_INK_WHITE, COL_INK);
                 } else {
-                    gfx_draw_text(24, cur_y + 6, &FONT_UI_11B, "Predicted rate", RAMP_INK_WHITE);
+                    gfx_draw_text(24, cur_y + 7, &FONT_UI_11B, "Predicted rate", RAMP_INK_WHITE);
                     char pb[40]; fmt_sci_math(ir->pred_rate, pb, sizeof(pb), 3);
-                    math_draw_right(304, cur_y + 5, pb, 14, RAMP_INK_WHITE, COL_INK);
+                    math_draw_right(304, cur_y + 6, pb, 14, RAMP_INK_WHITE, COL_INK);
                 }
-                gfx_hline(14, cur_y + 26, 292, COL_BORDER);
-                cur_y += 28;
+                gfx_hline(14, cur_y + 28, 292, COL_BORDER);
+                cur_y += 30;
             }
         }
-        ui_draw_keycap(10, 196, "UP/DN", "steps");
-        ui_draw_keycap(104, 196, "ENTER", "predict");
-        ui_draw_keycap(206, 196, "CLEAR", "table");
+        ui_draw_softkeys("Table", "Prev", "Next", "Edit[]", "Home", -1);
     }
-    ui_draw_bottom_tabs(1);
 }
 
+/* ============================================================================
+ * Screen 3: Integrated Rate Laws (Plots | Eq Solver | Data Table | Pseudo)
+ * ============================================================================ */
 static void draw_mini_plot(int x, int y, int w, int h, const double *tx, const double *vy,
                            int n, const LinReg *reg, const char *title, bool winner) {
     gfx_fill_rrect(x, y, w, h, 3, winner ? COL_GREEN_BG : COL_WHITE);
     gfx_draw_rrect(x, y, w, h, 3, winner ? COL_GREEN : COL_BORDER);
-    gfx_draw_text_center(x + w / 2, y + 3, &FONT_UI_11B, title,
-                         winner ? RAMP_GREEN_BG : RAMP_INK_WHITE);
+    gfx_draw_text_center(x + w / 2, y + 3, &FONT_UI_11B, title, winner ? RAMP_GREEN_BG : RAMP_INK_WHITE);
 
     int px = x + 8, py = y + 19, pw = w - 16, ph = h - 38;
     gfx_vline(px, py, ph, COL_MUTED);
@@ -622,10 +644,8 @@ static void draw_mini_plot(int x, int y, int w, int h, const double *tx, const d
         gfx_fill_circle(dx, dy, 2, COL_INK);
     }
 
-    char r2s[24];
-    snprintf(r2s, sizeof(r2s), "R2=%.4f", reg->r2);
-    gfx_draw_text_center(x + w / 2, y + h - 15, &FONT_UI_11, r2s,
-                         winner ? RAMP_GREEN_BG : RAMP_MUTED_WHITE);
+    char r2s[24]; snprintf(r2s, sizeof(r2s), "R2=%.4f", reg->r2);
+    gfx_draw_text_center(x + w / 2, y + h - 15, &FONT_UI_11, r2s, winner ? RAMP_GREEN_BG : RAMP_MUTED_WHITE);
 }
 
 static void render_integrated(const AppState *app) {
@@ -637,27 +657,26 @@ static void render_integrated(const AppState *app) {
         for (int i = 0; i < it->num_rows; i++) {
             y0[i] = it->c[i]; y1[i] = log(it->c[i]); y2[i] = 1.0 / it->c[i];
         }
-        draw_mini_plot(8,   26, 98, 102, it->t, y0, it->num_rows, &it->reg[0], "[A] vs t",   it->best_order == 0);
-        draw_mini_plot(111, 26, 98, 102, it->t, y1, it->num_rows, &it->reg[1], "ln[A] vs t", it->best_order == 1);
-        draw_mini_plot(214, 26, 98, 102, it->t, y2, it->num_rows, &it->reg[2], "1/[A] vs t", it->best_order == 2);
+        draw_mini_plot(8,   26, 98, 108, it->t, y0, it->num_rows, &it->reg[0], "[A] vs t",   it->best_order == 0);
+        draw_mini_plot(111, 26, 98, 108, it->t, y1, it->num_rows, &it->reg[1], "ln[A] vs t", it->best_order == 1);
+        draw_mini_plot(214, 26, 98, 108, it->t, y2, it->num_rows, &it->reg[2], "1/[A] vs t", it->best_order == 2);
 
-        gfx_fill_rrect(8, 134, 304, 56, 4, COL_BLUE_BG);
+        gfx_fill_rrect(8, 140, 304, 68, 4, COL_BLUE_BG);
         const char *onames[3] = { "ZERO ORDER (n = 0)", "FIRST ORDER (n = 1)", "SECOND ORDER (n = 2)" };
-        gfx_draw_text(16, 140, &FONT_UI_11B, onames[it->best_order], RAMP_ACCENT_BLUE);
+        gfx_draw_text(16, 146, &FONT_UI_11B, onames[it->best_order], RAMP_ACCENT_BLUE);
         char kb[40], ku[40], kl[90];
         fmt_sci_math(it->k, kb, sizeof(kb), 3);
         kinetics_format_k_units((double)it->best_order, "s", ku, sizeof(ku));
         snprintf(kl, sizeof(kl), "~k~ = %s %s", kb, ku);
-        math_draw(16, 158, kl, 14, RAMP_INK_BLUE, COL_INK);
+        math_draw(16, 168, kl, 14, RAMP_INK_BLUE, COL_INK);
 
         char slp[48]; snprintf(slp, sizeof(slp), "slope = %s~k~", it->best_order == 2 ? "+" : SYM_MINUS);
-        math_draw_right(302, 140, slp, 14, RAMP_MUTED_BLUE, COL_MUTED);
-        ui_draw_keycap(10, 196, "APPS", "edit data");
-        ui_draw_keycap(118, 196, "MODE", "eq/pseudo");
+        math_draw_right(302, 146, slp, 14, RAMP_MUTED_BLUE, COL_MUTED);
+        ui_draw_softkeys("Plots", "Eq.Slv", "Data", "Pseudo", "Home", 0);
     } else if (app->sub_mode == 1) {
         const IntegratedEqState *eq = &app->int_eq;
-        char st[24]; snprintf(st, sizeof(st), "ORDER %d " SYM_DOT " SOLVE", eq->order);
-        ui_draw_topbar("Integrated Law", st);
+        char st[24]; snprintf(st, sizeof(st), "ORDER %d " SYM_DOT " SOLVER", eq->order);
+        ui_draw_topbar("Integrated Eq.", st);
 
         const char *fstr = (eq->order == 0) ? "[A]_{~t~} = " SYM_MINUS "~kt~ + [A]_{0}"
                          : (eq->order == 1) ? "ln\\f{[A]_{0}}{[A]_{~t~}} = ~kt~"
@@ -670,29 +689,26 @@ static void render_integrated(const AppState *app) {
         const char *flab[4] = { "[A]0 (initial)", "[A]t (at time t)", "Rate const k", "Time t" };
         double fval[4] = { eq->A0, eq->At, eq->k, eq->t };
         for (int i = 0; i < 4; i++) {
-            int y = 74 + i * 20;
+            int y = 74 + i * 22;
             bool sel = (app->cursor_r == i);
             bool unk = (eq->unknown == i);
-            if (sel) gfx_fill_rrect(10, y, 300, 18, 3, COL_BLUE_BG);
-            gfx_draw_text(18, y + 2, &FONT_UI_11B, flab[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-            if (unk) ui_draw_pill(145, y + 1, "SOLVED", COL_GREEN_BG, RAMP_GREEN_BG);
-            char vb[40]; fmt_sci_math(fval[i], vb, sizeof(vb), 3);
-            math_draw_right(302, y + 1, vb, 14, unk ? RAMP_GREEN_WHITE : RAMP_INK_WHITE, COL_INK);
+            if (sel) gfx_fill_rrect(10, y, 300, 20, 3, COL_BLUE_BG);
+            gfx_draw_text(18, y + 3, &FONT_UI_11B, flab[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            if (unk) ui_draw_pill(138, y + 2, "SOLVED", COL_GREEN_BG, RAMP_GREEN_BG);
+            draw_inline_value(302, y + 3, fval[i], sel && app->editing, app,
+                              unk ? RAMP_GREEN_WHITE : (sel ? RAMP_INK_BLUE : RAMP_INK_WHITE));
         }
 
-        gfx_fill_rrect(10, 158, 300, 32, 3, COL_GRAY_BG);
+        gfx_fill_rrect(10, 166, 300, 42, 3, COL_GRAY_BG);
         char hl[96];
-        snprintf(hl, sizeof(hl), "t1/2: 1st=%.3g  2nd=%.3g  3rd=%.3g (%.1f%%)",
+        snprintf(hl, sizeof(hl), "t1/2: 1st=%.3g  2nd=%.3g  3rd=%.3g (%.1f%% left)",
                  eq->t_half_1, eq->t_half_2, eq->t_half_3, eq->pct_remaining);
-        gfx_draw_text_center(160, 168, &FONT_UI_11, hl, RAMP_INK_GRAY);
-
-        ui_draw_keycap(10, 196, "ENTER", "edit");
-        ui_draw_keycap(86, 196, "APPS", "solve");
-        ui_draw_keycap(166, 196, "L/R", "order");
-        ui_draw_keycap(236, 196, "MODE", "next");
+        gfx_draw_text_center(160, 173, &FONT_UI_11B, hl, RAMP_INK_GRAY);
+        gfx_draw_text_center(160, 190, &FONT_UI_11, "L/R: Order 0/1/2/3   APPS: Mark Unknown", RAMP_MUTED_WHITE);
+        ui_draw_softkeys("Plots", "Eq.Slv", "Data", "Pseudo", "Home", 1);
     } else if (app->sub_mode == 2) {
         const IntegratedTableState *it = &app->int_table;
-        char st[24]; snprintf(st, sizeof(st), "%d DATA ROWS", it->num_rows);
+        char st[24]; snprintf(st, sizeof(st), "%d ROWS (+/-)", it->num_rows);
         ui_draw_topbar("Integrated Data", st);
 
         int y0 = 26;
@@ -705,51 +721,89 @@ static void render_integrated(const AppState *app) {
 
         int vis = it->num_rows < 7 ? it->num_rows : 7;
         for (int r = 0; r < vis; r++) {
-            int ry = y0 + 18 + r * 20;
-            gfx_draw_rect(10, ry, 300, 20, COL_BORDER);
-            char b0[16], b1[16], b2[16], b3[16];
-            fmt_compact(it->t[r], b0, sizeof(b0));
-            fmt_compact(it->c[r], b1, sizeof(b1));
+            int ry = y0 + 18 + r * 22;
+            gfx_draw_rect(10, ry, 300, 22, COL_BORDER);
+            bool s0 = (app->cursor_r == r && app->cursor_c == 0);
+            bool s1 = (app->cursor_r == r && app->cursor_c == 1);
+            if (s0) gfx_fill_rect(11, ry + 1, 74, 20, COL_BLUE_BG);
+            if (s1) gfx_fill_rect(86, ry + 1, 74, 20, COL_BLUE_BG);
+
+            if (s0 && app->editing) gfx_draw_text(18, ry + 4, &FONT_UI_11B, app->edit_buf, RAMP_ACCENT_BLUE);
+            else { char b0[16]; fmt_compact(it->t[r], b0, sizeof(b0)); gfx_draw_text(22, ry + 4, &FONT_UI_11, b0, s0 ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE); }
+
+            if (s1 && app->editing) gfx_draw_text(92, ry + 4, &FONT_UI_11B, app->edit_buf, RAMP_ACCENT_BLUE);
+            else { char b1[16]; fmt_compact(it->c[r], b1, sizeof(b1)); gfx_draw_text(98, ry + 4, &FONT_UI_11, b1, s1 ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE); }
+
+            char b2[16], b3[16];
             fmt_compact(log(it->c[r]), b2, sizeof(b2));
             fmt_compact(1.0 / it->c[r], b3, sizeof(b3));
-            if (app->cursor_r == r && app->cursor_c == 0) gfx_fill_rect(11, ry + 1, 74, 18, COL_BLUE_BG);
-            if (app->cursor_r == r && app->cursor_c == 1) gfx_fill_rect(86, ry + 1, 74, 18, COL_BLUE_BG);
-            gfx_draw_text(22, ry + 3, &FONT_UI_11, b0, RAMP_INK_WHITE);
-            gfx_draw_text(98, ry + 3, &FONT_UI_11, b1, RAMP_INK_WHITE);
-            gfx_draw_text(172, ry + 3, &FONT_UI_11, b2, RAMP_MUTED_WHITE);
-            gfx_draw_text(244, ry + 3, &FONT_UI_11, b3, RAMP_MUTED_WHITE);
+            gfx_draw_text(172, ry + 4, &FONT_UI_11, b2, RAMP_MUTED_WHITE);
+            gfx_draw_text(244, ry + 4, &FONT_UI_11, b3, RAMP_MUTED_WHITE);
         }
-        ui_draw_keycap(10, 196, "ENTER", "edit");
-        ui_draw_keycap(92, 196, "+/-", "rows");
-        ui_draw_keycap(178, 196, "MODE", "plots");
+        ui_draw_softkeys("Plots", "Eq.Slv", "Data", "Pseudo", "Home", 2);
     } else {
         ui_draw_topbar("Pseudo-Order", "k' " SYM_ARROW " TRUE k");
         double k_true = kinetics_pseudo_k(app->pseudo_kp, app->pseudo_excess, app->pseudo_order);
         gfx_fill_rrect(10, 28, 300, 56, 4, COL_BLUE_BG);
         math_draw_center(160, 36, "~k~ = \\f{~k~" SYM_PRIME "}{[B]_{0}^{~m~}}", 14, RAMP_MUTED_BLUE, COL_MUTED);
-        char kb[40], kl[64];
-        fmt_sci_math(k_true, kb, sizeof(kb), 3);
+        char kb[40], kl[64]; fmt_sci_math(k_true, kb, sizeof(kb), 3);
         snprintf(kl, sizeof(kl), "True ~k~ = %s", kb);
         math_draw_center(160, 62, kl, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
 
         const char *pl[3] = { "Pseudo k' (-slope)", "Excess [B]0 (M)", "Order m of B" };
         double pv[3] = { app->pseudo_kp, app->pseudo_excess, app->pseudo_order };
         for (int i = 0; i < 3; i++) {
-            int y = 96 + i * 26;
+            int y = 96 + i * 28;
             bool sel = (app->cursor_r == i);
-            if (sel) gfx_fill_rrect(10, y, 300, 22, 3, COL_BLUE_BG);
-            gfx_draw_text(18, y + 4, &FONT_UI_11B, pl[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
-            char vb[24]; fmt_compact(pv[i], vb, sizeof(vb));
-            gfx_draw_text_right(302, y + 4, &FONT_UI_11B, vb, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
+            if (sel) gfx_fill_rrect(10, y, 300, 24, 3, COL_BLUE_BG);
+            gfx_draw_text(18, y + 5, &FONT_UI_11B, pl[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            draw_inline_value(302, y + 5, pv[i], sel && app->editing, app, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
         }
-        ui_draw_keycap(10, 196, "ENTER", "edit");
-        ui_draw_keycap(106, 196, "MODE", "plots");
+        ui_draw_softkeys("Plots", "Eq.Slv", "Data", "Pseudo", "Home", 3);
     }
-    ui_draw_bottom_tabs(2);
 }
 
+/* ============================================================================
+ * Screen 4: Custom Mechanisms Builder (ZERO Popups — Inline Step Editor!)
+ * ============================================================================ */
 static void render_mech(const AppState *app) {
     const MechState *m = &app->mech;
+    if (app->mech_editing) {
+        const MechStep *st = &m->steps[app->cursor_r];
+        char hdr[48]; snprintf(hdr, sizeof(hdr), "EDIT STEP %d (NO POPUP)", app->cursor_r + 1);
+        ui_draw_topbar("Mechanisms", hdr);
+
+        const char *rlab[5] = { "Reactant 1", "Reactant 2", "Product 1", "Product 2", "Step Speed" };
+        for (int i = 0; i < 5; i++) {
+            int y = 32 + i * 30;
+            bool sel = (app->mech_field == i);
+            gfx_fill_rrect(10, y, 300, 26, 3, sel ? COL_BLUE_BG : COL_WHITE);
+            gfx_draw_rrect(10, y, 300, 26, 3, sel ? COL_ACCENT : COL_BORDER);
+            gfx_draw_text(18, y + 6, &FONT_UI_11B, rlab[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+
+            char val[32];
+            if (i == 0) {
+                if (st->n_react >= 1) snprintf(val, sizeof(val), "%d %s", st->react[0].coeff, st->react[0].formula);
+                else strcpy(val, "-- (none)");
+            } else if (i == 1) {
+                if (st->n_react >= 2) snprintf(val, sizeof(val), "%d %s", st->react[1].coeff, st->react[1].formula);
+                else strcpy(val, "-- (none)");
+            } else if (i == 2) {
+                if (st->n_prod >= 1) snprintf(val, sizeof(val), "%d %s", st->prod[0].coeff, st->prod[0].formula);
+                else strcpy(val, "-- (none)");
+            } else if (i == 3) {
+                if (st->n_prod >= 2) snprintf(val, sizeof(val), "%d %s", st->prod[1].coeff, st->prod[1].formula);
+                else strcpy(val, "-- (none)");
+            } else {
+                strcpy(val, st->speed == STEP_SLOW ? "SLOW (RDS)" : (st->speed == STEP_FAST_EQ ? "FAST EQ (" SYM_EQUIL ")" : "FAST"));
+            }
+            gfx_draw_text_right(302, y + 6, &FONT_UI_11B, val, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
+        }
+        gfx_draw_text(12, 192, &FONT_UI_11, "L/R: Pick Species   +/-: Coeff (1-3)   ENTER: Done", RAMP_MUTED_WHITE);
+        ui_draw_softkeys("Done", "PrevSp", "NextSp", "Coeff+", "Home", 0);
+        return;
+    }
+
     char st[28]; snprintf(st, sizeof(st), "%d STEPS " SYM_DOT " CUSTOM", m->num_steps);
     ui_draw_topbar("Mechanisms", st);
 
@@ -784,7 +838,7 @@ static void render_mech(const AppState *app) {
         ui_draw_pill(248, y, tag, bg, rp);
     }
 
-    gfx_fill_rrect(10, 102, 300, 61, 4, COL_BLUE_BG);
+    gfx_fill_rrect(10, 102, 300, 62, 4, COL_BLUE_BG);
     gfx_draw_text(18, 105, &FONT_UI_11B, "Overall:", RAMP_MUTED_BLUE);
     math_draw(72, 104, m->overall_eq, 14, RAMP_INK_BLUE, COL_INK);
 
@@ -802,22 +856,22 @@ static void render_mech(const AppState *app) {
     for (int i = 0; i < m->n_species; i++) {
         if (m->is_intermediate[i]) {
             char b[28]; snprintf(b, sizeof(b), "Int: %s", m->species_name[i]);
-            ui_draw_pill(bx, 168, b, COL_AMBER_BG, RAMP_AMBER_BG);
+            ui_draw_pill(bx, 170, b, COL_AMBER_BG, RAMP_AMBER_BG);
             bx += gfx_text_width(&FONT_UI_11B, b) + 14;
         }
         if (m->is_catalyst[i]) {
             char b[28]; snprintf(b, sizeof(b), "Cat: %s", m->species_name[i]);
-            ui_draw_pill(bx, 168, b, COL_GREEN_BG, RAMP_GREEN_BG);
+            ui_draw_pill(bx, 170, b, COL_GREEN_BG, RAMP_GREEN_BG);
             bx += gfx_text_width(&FONT_UI_11B, b) + 14;
         }
     }
-
-    ui_draw_keycap(10, 196, "ENTER", "edit step");
-    ui_draw_keycap(116, 196, "L/R", "speed");
-    ui_draw_keycap(196, 196, "+/-", "2/3 stp");
-    ui_draw_bottom_tabs(3);
+    gfx_draw_text(12, 196, &FONT_UI_11, "UP/DN: pick step  ENTER: edit species  L/R: speed", RAMP_MUTED_WHITE);
+    ui_draw_softkeys("Edit", "Speed", "2/3Stp", "Examp", "Home", -1);
 }
 
+/* ============================================================================
+ * Screen 5: Arrhenius (2-Pt | ln k vs 1/T Plot | Energy Profile) — Inline!
+ * ============================================================================ */
 static void render_arrhenius(const AppState *app) {
     if (app->sub_mode == 0) {
         const ArrhTwoPtState *a = &app->arrh2;
@@ -834,71 +888,69 @@ static void render_arrhenius(const AppState *app) {
         double vals[5] = { a->Ea_kj, a->k2, app->arrh_celsius ? (a->T2 - 273.15) : a->T2,
                            a->k1, app->arrh_celsius ? (a->T1 - 273.15) : a->T1 };
         for (int i = 0; i < 5; i++) {
-            int y = 74 + i * 22;
+            int y = 74 + i * 23;
             bool sel = (app->cursor_r == i);
             bool unk = (a->unknown == i);
             if (sel) gfx_fill_rrect(10, y, 300, 20, 3, COL_BLUE_BG);
             gfx_draw_text(18, y + 3, &FONT_UI_11B, labs[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
             if (unk) ui_draw_pill(116, y + 2, "SOLVED", COL_GREEN_BG, RAMP_GREEN_BG);
-            char vb[40]; fmt_sci_math(vals[i], vb, sizeof(vb), 3);
-            math_draw_right(302, y + 2, vb, 14, unk ? RAMP_GREEN_WHITE : RAMP_INK_WHITE, COL_INK);
+            draw_inline_value(302, y + 3, vals[i], sel && app->editing, app,
+                              unk ? RAMP_GREEN_WHITE : (sel ? RAMP_INK_BLUE : RAMP_INK_WHITE));
         }
-        ui_draw_keycap(10, 196, "ENTER", "edit");
-        ui_draw_keycap(84, 196, "APPS", "solve");
-        ui_draw_keycap(158, 196, "L/R", "C/K");
-        ui_draw_keycap(222, 196, "MODE", "plot");
+        gfx_draw_text(12, 196, &FONT_UI_11, "Type # + ENTER   APPS: mark unknown to solve", RAMP_MUTED_WHITE);
+        ui_draw_softkeys("2-Pt", "Plot", "Energy", app->arrh_celsius ? "-> K" : "-> C", "Home", 0);
     } else if (app->sub_mode == 1) {
         const ArrhTableState *at = &app->arrh_tbl;
         ui_draw_topbar("Arrhenius Plot", "ln k vs 1/T");
 
         double ix[MAX_ARRH_ROWS], ly[MAX_ARRH_ROWS];
         for (int i = 0; i < at->num_rows; i++) { ix[i] = 1.0 / at->T[i]; ly[i] = log(at->k[i]); }
-        draw_mini_plot(10, 26, 146, 114, ix, ly, at->num_rows, &at->reg, "ln(k) vs 1/T", true);
+        draw_mini_plot(10, 26, 138, 108, ix, ly, at->num_rows, &at->reg, "ln(k) vs 1/T", true);
 
-        gfx_fill_rrect(164, 26, 146, 114, 4, COL_BLUE_BG);
-        gfx_draw_text(172, 32, &FONT_UI_11B, "Linear Fit Results", RAMP_ACCENT_BLUE);
+        gfx_fill_rrect(156, 26, 154, 108, 4, COL_BLUE_BG);
+        gfx_draw_text(164, 31, &FONT_UI_11B, "Linear Fit Results", RAMP_ACCENT_BLUE);
         char e1[48], a1[48], k1[48];
         snprintf(e1, sizeof(e1), "~E~_{a} = %.1f kJ", at->Ea_kj);
-        math_draw(172, 52, e1, 14, RAMP_INK_BLUE, COL_INK);
+        math_draw(164, 50, e1, 14, RAMP_INK_BLUE, COL_INK);
         fmt_sci_math(at->A_factor, a1, sizeof(a1), 2);
         char al[56]; snprintf(al, sizeof(al), "~A~ = %s", a1);
-        math_draw(172, 76, al, 14, RAMP_INK_BLUE, COL_INK);
+        math_draw(164, 72, al, 14, RAMP_INK_BLUE, COL_INK);
         fmt_sci_math(at->eval_k, k1, sizeof(k1), 2);
-        char kl[96]; snprintf(kl, sizeof(kl), "~k~(%.0fK) = %s", at->eval_T, k1);
-        math_draw(172, 100, kl, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
+        char kl[96]; snprintf(kl, sizeof(kl), "~k~(%.0fK)=%s", at->eval_T, k1);
+        math_draw(164, 96, kl, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
 
-        gfx_fill_rrect(10, 146, 300, 44, 3, COL_GRAY_BG);
-        char tr[96];
-        snprintf(tr, sizeof(tr), "Pts: %d  (T1=%.0fK, k1=%.2e)  slope=-Ea/R",
-                 at->num_rows, at->T[0], at->k[0]);
-        gfx_draw_text_center(160, 152, &FONT_UI_11, tr, RAMP_INK_GRAY);
-        gfx_draw_text_center(160, 168, &FONT_UI_11, "ENTER: edit (T,k) pts   APPS: eval new T", RAMP_MUTED_WHITE);
-
-        ui_draw_keycap(10, 196, "ENTER", "edit pts");
-        ui_draw_keycap(112, 196, "APPS", "eval T");
-        ui_draw_keycap(206, 196, "MODE", "energy");
+        /* Inline editable (T, k) rows below plot */
+        for (int r = 0; r < 3; r++) {
+            int y = 140 + r * 20;
+            bool s0 = (app->cursor_r == r && app->cursor_c == 0);
+            bool s1 = (app->cursor_r == r && app->cursor_c == 1);
+            char pl[16]; snprintf(pl, sizeof(pl), "Pt %d  T:", r + 1);
+            gfx_draw_text(14, y + 3, &FONT_UI_11, pl, (app->cursor_r == r) ? RAMP_ACCENT_WHITE : RAMP_MUTED_WHITE);
+            draw_inline_value(136, y + 3, at->T[r], s0 && app->editing, app, s0 ? RAMP_ACCENT_WHITE : RAMP_INK_WHITE);
+            gfx_draw_text(154, y + 3, &FONT_UI_11, "k:", (app->cursor_r == r) ? RAMP_ACCENT_WHITE : RAMP_MUTED_WHITE);
+            draw_inline_value(302, y + 3, at->k[r], s1 && app->editing, app, s1 ? RAMP_ACCENT_WHITE : RAMP_INK_WHITE);
+        }
+        ui_draw_softkeys("2-Pt", "Plot", "Energy", "EvalT", "Home", 1);
     } else {
         const CatalystState *c = &app->cat;
         ui_draw_topbar("Energy Profile", c->delta_E_kj < 0 ? "EXOTHERMIC" : "ENDOTHERMIC");
 
-        int px = 14, py = 28, pw = 292, ph = 112;
+        int px = 12, py = 26, pw = 296, ph = 94;
         gfx_fill_rrect(px, py, pw, ph, 4, COL_WHITE);
         gfx_draw_rrect(px, py, pw, ph, 4, COL_BORDER);
+        gfx_vline(px + 20, py + 8, ph - 22, COL_INK);
+        gfx_hline(px + 20, py + ph - 14, pw - 32, COL_INK);
+        gfx_draw_text(px + 6, py + 10, &FONT_UI_11B, "E", RAMP_MUTED_WHITE);
+        gfx_draw_text_right(px + pw - 14, py + ph - 13, &FONT_UI_11, "Rxn Progress", RAMP_MUTED_WHITE);
 
-        gfx_vline(px + 20, py + 10, ph - 26, COL_INK);
-        gfx_hline(px + 20, py + ph - 16, pw - 32, COL_INK);
-        gfx_draw_text(px + 6, py + 12, &FONT_UI_11B, "E", RAMP_MUTED_WHITE);
-        gfx_draw_text_right(px + pw - 14, py + ph - 14, &FONT_UI_11, "Rxn Progress", RAMP_MUTED_WHITE);
-
-        int y_r = (c->delta_E_kj < 0) ? (py + 62) : (py + 82);
-        int y_p = (c->delta_E_kj < 0) ? (py + 88) : (py + 58);
-        int y_pk_un  = py + 18;
-        int y_pk_cat = py + 40;
+        int y_r = (c->delta_E_kj < 0) ? (py + 52) : (py + 68);
+        int y_p = (c->delta_E_kj < 0) ? (py + 72) : (py + 46);
+        int y_pk_un = py + 14, y_pk_cat = py + 32;
 
         int prev_x = px + 28, prev_yu = y_r, prev_yc = y_r;
         for (int i = 1; i <= 40; i++) {
             double u = (double)i / 40.0;
-            int gx = px + 28 + (int)(u * 244.0);
+            int gx = px + 28 + (int)(u * 246.0);
             double base = (double)y_r + (double)(y_p - y_r) / (1.0 + exp(-12.0 * (u - 0.5)));
             double hump = exp(-28.0 * (u - 0.5) * (u - 0.5));
             int yu = (int)(base - hump * ((double)y_r - (double)y_pk_un));
@@ -908,57 +960,68 @@ static void render_arrhenius(const AppState *app) {
             prev_x = gx; prev_yu = yu; prev_yc = yc;
         }
         gfx_dashed_line(px + 28, y_r, px + 266, y_r, COL_BORDER);
-        gfx_draw_text(px + 30, y_r - 13, &FONT_UI_11B, "R", RAMP_INK_WHITE);
-        gfx_draw_text(px + 258, y_p - 13, &FONT_UI_11B, "P", RAMP_INK_WHITE);
+        gfx_draw_text(px + 30, y_r - 12, &FONT_UI_11B, "R", RAMP_INK_WHITE);
+        gfx_draw_text(px + 258, y_p - 12, &FONT_UI_11B, "P", RAMP_INK_WHITE);
         gfx_draw_text(px + 158, y_pk_un - 2, &FONT_UI_11B, "Uncat", RAMP_RED_WHITE);
         gfx_draw_text(px + 158, y_pk_cat - 2, &FONT_UI_11B, "Cat", RAMP_GREEN_WHITE);
 
-        gfx_fill_rrect(14, 146, 292, 44, 4, COL_BLUE_BG);
-        char l1[80], l2[80], sb[36];
-        snprintf(l1, sizeof(l1), "~E~_{a,fwd}=%.0f  ~E~_{a,rev}=%.0f  " SYM_DELTA "~E~=%.0f kJ",
-                 c->Ea_uncat_kj, c->Ea_rev_kj, c->delta_E_kj);
-        fmt_sci_math(c->speedup_ratio, sb, sizeof(sb), 3);
-        snprintf(l2, sizeof(l2), "~k~_{cat}/~k~_{un} = %s  (at %.0f K)", sb, c->T_kelvin);
-        math_draw_center(160, 150, l1, 14, RAMP_INK_BLUE, COL_INK);
-        math_draw_center(160, 169, l2, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
+        /* Inline editable Ea / dE / T + live speedup & Ea,rev! */
+        const char *clab[4] = { "Ea(un)", "Ea(cat)", "Delta E", "Temp K" };
+        double cval[4] = { c->Ea_uncat_kj, c->Ea_cat_kj, c->delta_E_kj, c->T_kelvin };
+        for (int i = 0; i < 4; i++) {
+            int col = i % 2, row = i / 2;
+            int bx = 12 + col * 150, by = 125 + row * 22;
+            bool sel = (app->cursor_r == i);
+            if (sel) gfx_fill_rrect(bx, by, 146, 20, 3, COL_BLUE_BG);
+            gfx_draw_text(bx + 6, by + 3, &FONT_UI_11B, clab[i], sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            draw_inline_value(bx + 140, by + 3, cval[i], sel && app->editing, app, sel ? RAMP_INK_BLUE : RAMP_INK_WHITE);
+        }
 
-        ui_draw_keycap(10, 196, "ENTER", "edit Ea/dE");
-        ui_draw_keycap(126, 196, "MODE", "2-pt solver");
+        gfx_fill_rrect(12, 172, 296, 38, 4, COL_BLUE_BG);
+        char sb[36], l1[96];
+        fmt_sci_math(c->speedup_ratio, sb, sizeof(sb), 3);
+        snprintf(l1, sizeof(l1), "~E~_{a,rev}=%.0f kJ    ~k~_{cat}/~k~_{un}=%s", c->Ea_rev_kj, sb);
+        math_draw_center(160, 182, l1, 14, RAMP_ACCENT_BLUE, COL_ACCENT);
+
+        ui_draw_softkeys("2-Pt", "Plot", "Energy", "Reset", "Home", 2);
     }
-    ui_draw_bottom_tabs(4);
 }
 
-static void render_summary(const AppState *app) {
-    char pg[24]; snprintf(pg, sizeof(pg), "GUIDE %d / 5", app->ref_page + 1);
-    ui_draw_topbar("Ref & Graphs", pg);
+/* ============================================================================
+ * Screen 6: FIXED Chart 12.6 & Visual Reference Graphs (ZERO Overlap!)
+ * ============================================================================ */
+static void render_ref_graphs(const AppState *app) {
+    const char *pnames[4] = { "TABLE 12.6", "MAXWELL-BOLTZ.", "MULTI-STEP RDS", "PROOF PLOTS" };
+    ui_draw_topbar("Chart & Graphs", pnames[app->ref_page]);
 
     if (app->ref_page == 0) {
-        int x0 = 6, y0 = 26;
-        gfx_fill_rect(x0, y0, 308, 18, COL_CHROME);
-        gfx_draw_rect(x0, y0, 308, 18, COL_BORDER);
-        gfx_draw_text(12, y0 + 2, &FONT_UI_11B, "Ord", RAMP_INK_CHROME);
-        gfx_draw_text(44, y0 + 2, &FONT_UI_11B, "Integrated Law", RAMP_INK_CHROME);
-        gfx_draw_text(168, y0 + 2, &FONT_UI_11B, "Plot (m)", RAMP_INK_CHROME);
-        gfx_draw_text(238, y0 + 2, &FONT_UI_11B, "Half-Life", RAMP_INK_CHROME);
-
-        const char *ord[3]  = { "0", "1", "2" };
-        const char *eqs[3]  = { "[A] = " SYM_MINUS "~kt~ + [A]_{0}",
-                                "ln[A] = " SYM_MINUS "~kt~ + ln[A]_{0}",
-                                "\\f{1}{[A]} = ~kt~ + \\f{1}{[A]_{0}}" };
-        const char *plts[3] = { "[A] (" SYM_MINUS "~k~)", "ln[A] (" SYM_MINUS "~k~)", "1/[A] (+~k~)" };
-        const char *hls[3]  = { "\\f{[A]_{0}}{2~k~}", "\\f{0.693}{~k~}", "\\f{1}{~k~[A]_{0}}" };
+        /* FIXED Table 12.6: 3 spacious horizontal order cards -> ZERO overlap! */
+        const char *hdrs[3] = { "ZERO ORDER (n = 0)", "FIRST ORDER (n = 1)", "SECOND ORDER (n = 2)" };
+        const char *eqs[3]  = { "[A]_{~t~} = " SYM_MINUS "~kt~ + [A]_{0}",
+                                "ln[A]_{~t~} = " SYM_MINUS "~kt~ + ln[A]_{0}",
+                                "1/[A]_{~t~} = ~kt~ + 1/[A]_{0}" };
+        const char *hls[3]  = { "~t~_{1/2} = [A]_{0} / 2~k~",
+                                "~t~_{1/2} = 0.693 / ~k~",
+                                "~t~_{1/2} = 1 / (~k~[A]_{0})" };
+        const char *meta[3] = { "Plot: [A] vs t (m=-k)    k: mol/(L" SYM_DOT "s)",
+                                "Plot: ln[A] vs t (m=-k)  k: s^-1 (const t1/2)",
+                                "Plot: 1/[A] vs t (m=+k)  k: L/(mol" SYM_DOT "s)" };
 
         for (int i = 0; i < 3; i++) {
-            int ry = y0 + 18 + i * 48;
-            gfx_fill_rect(x0, ry, 308, 48, (i == 1) ? COL_BLUE_BG : COL_WHITE);
-            gfx_draw_rect(x0, ry, 308, 48, COL_BORDER);
-            uint8_t rmp = (i == 1) ? RAMP_INK_BLUE : RAMP_INK_WHITE;
-            gfx_draw_text(16, ry + 16, &FONT_UI_13B, ord[i], rmp);
-            math_draw(42, ry + 15, eqs[i], 14, rmp, COL_INK);
-            math_draw(166, ry + 15, plts[i], 10, rmp, COL_INK);
-            math_draw(242, ry + 15, hls[i], 14, rmp, COL_INK);
+            int y = 26 + i * 62;
+            uint8_t bg = (i == 1) ? COL_BLUE_BG : COL_WHITE;
+            uint8_t rm = (i == 1) ? RAMP_INK_BLUE : RAMP_INK_WHITE;
+            uint8_t am = (i == 1) ? RAMP_ACCENT_BLUE : RAMP_ACCENT_WHITE;
+            uint8_t mm = (i == 1) ? RAMP_MUTED_BLUE : RAMP_MUTED_WHITE;
+            gfx_fill_rrect(8, y, 304, 57, 4, bg);
+            gfx_draw_rrect(8, y, 304, 57, 4, (i == 1) ? COL_ACCENT : COL_BORDER);
+            gfx_draw_text(16, y + 4, &FONT_UI_11B, hdrs[i], am);
+            math_draw_right(304, y + 3, hls[i], 14, rm, COL_INK);
+            math_draw(16, y + 21, eqs[i], 14, rm, COL_INK);
+            gfx_draw_text(16, y + 40, &FONT_UI_11, meta[i], mm);
         }
     } else if (app->ref_page == 1) {
+        /* Maxwell-Boltzmann Energy Distribution */
         int px = 14, py = 28, pw = 292, ph = 114;
         gfx_fill_rrect(px, py, pw, ph, 4, COL_WHITE);
         gfx_draw_rrect(px, py, pw, ph, 4, COL_BORDER);
@@ -967,8 +1030,7 @@ static void render_summary(const AppState *app) {
         gfx_draw_text(px + 4, py + 12, &FONT_UI_11B, "N", RAMP_MUTED_WHITE);
         gfx_draw_text_right(px + pw - 14, py + ph - 14, &FONT_UI_11, "Kinetic Energy", RAMP_MUTED_WHITE);
 
-        int base_y = py + ph - 16;
-        int ea_x = px + 186;
+        int base_y = py + ph - 16, ea_x = px + 186;
         gfx_dashed_line(ea_x, py + 12, ea_x, base_y, COL_INK);
         gfx_draw_text(ea_x + 3, py + 12, &FONT_UI_11B, "Ea", RAMP_INK_WHITE);
 
@@ -984,18 +1046,19 @@ static void render_summary(const AppState *app) {
             gfx_line(p2x, p2y, gx, y2, COL_RED);
             if (gx >= ea_x) {
                 gfx_vline(gx, y2, base_y - y2, COL_RED_BG);
-                gfx_pixel(gx, y1, COL_ACCENT);
-                gfx_pixel(gx, y2, COL_RED);
+                gfx_pixel(gx, y1, COL_ACCENT); gfx_pixel(gx, y2, COL_RED);
             }
             p1x = gx; p1y = y1; p2x = gx; p2y = y2;
         }
         gfx_draw_text(px + 72, py + 24, &FONT_UI_11B, "T1", RAMP_ACCENT_WHITE);
         gfx_draw_text(px + 130, py + 52, &FONT_UI_11B, "T2 > T1", RAMP_RED_WHITE);
 
-        gfx_fill_rrect(14, 146, 292, 44, 4, COL_BLUE_BG);
-        gfx_draw_text(22, 151, &FONT_UI_11B, "Higher T " SYM_ARROW " curve shifts right & flattens", RAMP_ACCENT_BLUE);
-        gfx_draw_text(22, 168, &FONT_UI_11, "More collisions exceed Ea " SYM_ARROW " larger k & faster rate", RAMP_INK_BLUE);
+        gfx_fill_rrect(14, 148, 292, 60, 4, COL_BLUE_BG);
+        gfx_draw_text(22, 154, &FONT_UI_11B, "Higher T " SYM_ARROW " shifts right & flattens peak", RAMP_ACCENT_BLUE);
+        gfx_draw_text(22, 171, &FONT_UI_11, "Ea stays FIXED (only a catalyst lowers Ea!).", RAMP_INK_BLUE);
+        gfx_draw_text(22, 187, &FONT_UI_11, "Shaded area >= Ea grows exponentially -> larger k.", RAMP_MUTED_BLUE);
     } else if (app->ref_page == 2) {
+        /* Multi-Step Energy Profile (RDS = tallest hump) */
         int px = 14, py = 28, pw = 292, ph = 114;
         gfx_fill_rrect(px, py, pw, ph, 4, COL_WHITE);
         gfx_draw_rrect(px, py, pw, ph, 4, COL_BORDER);
@@ -1010,8 +1073,7 @@ static void render_summary(const AppState *app) {
             int gx = px + 26 + (int)(u * 246.0);
             double h1 = 26.0 * exp(-42.0 * (u - 0.30) * (u - 0.30));
             double h2 = 54.0 * exp(-36.0 * (u - 0.68) * (u - 0.68));
-            double drift = 16.0 * u;
-            int gy = py + 72 + (int)drift - (int)(h1 + h2);
+            int gy = py + 72 + (int)(16.0 * u) - (int)(h1 + h2);
             gfx_line(prev_x, prev_y, gx, gy, COL_ACCENT);
             prev_x = gx; prev_y = gy;
         }
@@ -1020,37 +1082,85 @@ static void render_summary(const AppState *app) {
         gfx_draw_text(px + 168, py + 14, &FONT_UI_11B, "Slow (RDS)", RAMP_RED_WHITE);
         gfx_draw_text(px + 258, py + 74, &FONT_UI_11B, "P", RAMP_INK_WHITE);
 
-        gfx_fill_rrect(14, 146, 292, 44, 4, COL_BLUE_BG);
-        gfx_draw_text(22, 151, &FONT_UI_11B, "2 humps = 2-step mechanism  (valley = Interm.)", RAMP_ACCENT_BLUE);
-        gfx_draw_text(22, 168, &FONT_UI_11, "Slowest step (RDS) always has the LARGEST Ea", RAMP_INK_BLUE);
-    } else if (app->ref_page == 3) {
-        gfx_fill_rrect(10, 28, 300, 162, 4, COL_WHITE);
-        gfx_draw_rrect(10, 28, 300, 162, 4, COL_BORDER);
-        gfx_draw_text(18, 34, &FONT_UI_11B, "How to Identify Order on the Exam:", RAMP_ACCENT_WHITE);
-        gfx_draw_text(18, 54, &FONT_UI_11B, "Zero Order (n = 0):", RAMP_INK_WHITE);
-        gfx_draw_text(18, 68, &FONT_UI_11, "  [A] vs t is straight (m = -k). t1/2 HALVES each time.", RAMP_MUTED_WHITE);
-        gfx_draw_text(18, 88, &FONT_UI_11B, "First Order (n = 1):", RAMP_INK_WHITE);
-        gfx_draw_text(18, 102, &FONT_UI_11, "  ln[A] vs t is straight (m = -k). t1/2 is CONSTANT.", RAMP_MUTED_WHITE);
-        gfx_draw_text(18, 122, &FONT_UI_11B, "Second Order (n = 2):", RAMP_INK_WHITE);
-        gfx_draw_text(18, 136, &FONT_UI_11, "  1/[A] vs t is straight (m = +k). t1/2 DOUBLES.", RAMP_MUTED_WHITE);
-        gfx_fill_rrect(16, 156, 288, 28, 3, COL_BLUE_BG);
-        gfx_draw_text(22, 163, &FONT_UI_11B, "Catalyst lowers Ea -> ln k vs 1/T slope LESS neg.", RAMP_ACCENT_BLUE);
+        gfx_fill_rrect(14, 148, 292, 60, 4, COL_BLUE_BG);
+        gfx_draw_text(22, 154, &FONT_UI_11B, "2 humps = 2-step mechanism (valley = Interm.)", RAMP_ACCENT_BLUE);
+        gfx_draw_text(22, 171, &FONT_UI_11, "Slow step (RDS) ALWAYS has the largest Ea.", RAMP_INK_BLUE);
+        gfx_draw_text(22, 187, &FONT_UI_11, "Delta E = E(P) - E(R) does NOT affect rate!", RAMP_MUTED_BLUE);
     } else {
-        gfx_fill_rrect(10, 28, 300, 162, 4, COL_WHITE);
-        gfx_draw_rrect(10, 28, 300, 162, 4, COL_BORDER);
-        gfx_draw_text(18, 34, &FONT_UI_11B, "Which Tab to Use on the Test:", RAMP_ACCENT_WHITE);
-        gfx_draw_text(18, 54, &FONT_UI_11, "Y= Rates:   d[A]/dt, stoich ratios, units of k", RAMP_INK_WHITE);
-        gfx_draw_text(18, 74, &FONT_UI_11, "WIN Init.R: Table of [A],[B] & Rate -> orders & k", RAMP_INK_WHITE);
-        gfx_draw_text(18, 94, &FONT_UI_11, "ZM Integ:   Table of t & [A], half-life, % left, k'", RAMP_INK_WHITE);
-        gfx_draw_text(18, 114, &FONT_UI_11, "TR Mech:    Custom 2/3-step mech -> Rate Law", RAMP_INK_WHITE);
-        gfx_draw_text(18, 134, &FONT_UI_11, "GR Arrh:    k1/k2 & T1/T2, Ea, catalysts, dE", RAMP_INK_WHITE);
-        gfx_fill_rrect(16, 156, 288, 28, 3, COL_GREEN_BG);
-        gfx_draw_text(22, 163, &FONT_UI_11B, "Tip: R = 8.3145 J/(mol" SYM_DOT "K), K = C + 273.15", RAMP_GREEN_BG);
+        /* 3 Proof Plots Visual Reference */
+        double tx[4] = { 0, 1, 2, 3 };
+        double d0[4] = { 4, 3, 2, 1 };
+        double d1[4] = { 4, 3, 2, 1 };
+        double d2[4] = { 1, 2, 3, 4 };
+        LinReg r0 = { -1, 4, 1.0 }, r1 = { -1, 4, 1.0 }, r2 = { 1, 1, 1.0 };
+        draw_mini_plot(8,   28, 98, 108, tx, d0, 4, &r0, "0th: [A] vs t",   true);
+        draw_mini_plot(111, 28, 98, 108, tx, d1, 4, &r1, "1st: ln[A]",      true);
+        draw_mini_plot(214, 28, 98, 108, tx, d2, 4, &r2, "2nd: 1/[A]",      true);
+
+        gfx_fill_rrect(8, 142, 304, 66, 4, COL_BLUE_BG);
+        gfx_draw_text(16, 148, &FONT_UI_11B, "Straight-Line Proof Rules & Half-Life:", RAMP_ACCENT_BLUE);
+        gfx_draw_text(16, 165, &FONT_UI_11, "0th: m = -k, t1/2 HALVES    1st: m = -k, t1/2 CONST", RAMP_INK_BLUE);
+        gfx_draw_text(16, 182, &FONT_UI_11, "2nd: m = +k, t1/2 DOUBLES   Arrh: ln k vs 1/T (-Ea/R)", RAMP_INK_BLUE);
+    }
+    ui_draw_softkeys("Table", "Maxw.", "Energy", "Plots", "Home", app->ref_page);
+}
+
+/* ============================================================================
+ * Screen 7: 12-Topic AP Chem Theories & FRQ Encyclopedia (Def | HowTo | Ex.)
+ * ============================================================================ */
+static void render_theory(const AppState *app) {
+    if (app->theory_list) {
+        char st[24]; snprintf(st, sizeof(st), "%d / %d TOPICS", app->theory_idx + 1, NUM_THEORIES);
+        ui_draw_topbar("Theories & FRQ", st);
+
+        int vis = 7;
+        int start = (app->theory_idx >= vis) ? (app->theory_idx - vis + 1) : 0;
+        for (int vi = 0; vi < vis && (start + vi) < NUM_THEORIES; vi++) {
+            int idx = start + vi;
+            int y = 25 + vi * 27;
+            bool sel = (idx == app->theory_idx);
+            if (sel) {
+                gfx_fill_rrect(8, y, 304, 24, 3, COL_BLUE_BG);
+                gfx_fill_rect(8, y + 3, 3, 18, COL_ACCENT);
+            } else {
+                gfx_hline(14, y + 25, 292, COL_GRID);
+            }
+            char nb[8]; snprintf(nb, sizeof(nb), "%d", idx + 1);
+            gfx_fill_rrect(16, y + 5, 18, 14, 2, sel ? COL_ACCENT : COL_GRAY_BG);
+            gfx_draw_text_center(25, y + 5, &FONT_UI_11B, nb, sel ? RAMP_WHITE_ACCENT : RAMP_MUTED_WHITE);
+            gfx_draw_text(40, y + 5, &FONT_UI_11B, THEORY_DB[idx].title, sel ? RAMP_ACCENT_BLUE : RAMP_INK_WHITE);
+            gfx_draw_text_right(304, y + 5, &FONT_UI_11, THEORY_DB[idx].section, sel ? RAMP_INK_BLUE : RAMP_MUTED_WHITE);
+        }
+        ui_draw_softkeys("Read", "Def", "HowTo", "Ex.", "Home", 0);
+        return;
     }
 
-    ui_draw_keycap(10, 196, "L/R", "next guide");
-    ui_draw_keycap(136, 196, "CLEAR", "home");
-    ui_draw_bottom_tabs(-1);
+    const TheoryTopic *t = &THEORY_DB[app->theory_idx];
+    char hdr[32]; snprintf(hdr, sizeof(hdr), "%s  (%d/%d)", t->section, app->theory_idx + 1, NUM_THEORIES);
+    ui_draw_topbar(t->title, hdr);
+
+    /* 3 clean pill headers */
+    const char *tabs[3] = { "1. Textbook Def", "2. How to Use", "3. Example" };
+    for (int i = 0; i < 3; i++) {
+        int bx = 10 + i * 102;
+        bool act = (app->theory_tab == i);
+        gfx_fill_rrect(bx, 26, 96, 20, 3, act ? COL_ACCENT : COL_GRAY_BG);
+        gfx_draw_text_center(bx + 48, 29, &FONT_UI_11B, tabs[i], act ? RAMP_WHITE_ACCENT : RAMP_MUTED_WHITE);
+    }
+
+    /* Spacious content card */
+    gfx_fill_rrect(10, 52, 300, 154, 4, (app->theory_tab == 2) ? COL_BLUE_BG : COL_WHITE);
+    gfx_draw_rrect(10, 52, 300, 154, 4, (app->theory_tab == 2) ? COL_ACCENT : COL_BORDER);
+    const char * const *lines = (app->theory_tab == 0) ? t->def_lines
+                              : (app->theory_tab == 1) ? t->how_lines : t->ex_lines;
+    uint8_t rmp = (app->theory_tab == 2) ? RAMP_INK_BLUE : RAMP_INK_WHITE;
+    for (int i = 0; i < 6; i++) {
+        if (lines[i] && lines[i][0]) {
+            gfx_draw_text(18, 60 + i * 23, &FONT_UI_11, lines[i], rmp);
+        }
+    }
+
+    ui_draw_softkeys("List", "Def", "HowTo", "Ex.", "Next", app->theory_tab + 1);
 }
 
 void app_render(const AppState *app) {
@@ -1062,144 +1172,151 @@ void app_render(const AppState *app) {
         case SCR_INTEGRATED: render_integrated(app); break;
         case SCR_MECH:       render_mech(app); break;
         case SCR_ARRHENIUS:  render_arrhenius(app); break;
-        case SCR_SUMMARY:    render_summary(app); break;
+        case SCR_REF_GRAPHS: render_ref_graphs(app); break;
+        case SCR_THEORY:     render_theory(app); break;
     }
     hal_swap_buffers();
 }
 
+/* ============================================================================
+ * Unified Zero-Popup Responsive Key Dispatcher
+ * ============================================================================ */
 bool app_handle_key(AppState *app, int k_in) {
     KeyCode k = (KeyCode)k_in;
     if (k == KEY_QUIT) return false;
 
-    if (k == KEY_F1) {
-        if (app->screen == SCR_RATES) app->sub_mode = (app->sub_mode + 1) % 3;
-        else { app->screen = SCR_RATES; app->sub_mode = 0; }
-        app->cursor_r = 0; return true;
-    }
-    if (k == KEY_F2) {
-        if (app->screen == SCR_INIT_RATES) app->sub_mode ^= 1;
-        else { app->screen = SCR_INIT_RATES; app->sub_mode = 0; }
-        app->cursor_r = 0; app->cursor_c = 0; return true;
-    }
-    if (k == KEY_F3) {
-        if (app->screen == SCR_INTEGRATED) app->sub_mode = (app->sub_mode + 1) % 4;
-        else { app->screen = SCR_INTEGRATED; app->sub_mode = 0; }
-        app->cursor_r = 0; return true;
-    }
-    if (k == KEY_F4) {
-        app->screen = SCR_MECH; app->cursor_r = 0; return true;
-    }
-    if (k == KEY_F5) {
-        if (app->screen == SCR_ARRHENIUS) app->sub_mode = (app->sub_mode + 1) % 3;
-        else { app->screen = SCR_ARRHENIUS; app->sub_mode = 0; }
-        app->cursor_r = 0; return true;
+    /* 1) Handle active inline text editing first (zero popups!) */
+    if (app->editing) {
+        if (k == KEY_CLEAR) { app->editing = false; return true; }
+        if (k == KEY_ENTER) { commit_inline_edit(app); return true; }
+        if (k == KEY_DEL) {
+            app->edit_first_key = false;
+            if (app->edit_len > 0) app->edit_buf[--app->edit_len] = '\0';
+            return true;
+        }
+        char ch = key_to_numchar(k);
+        if (k == KEY_MINUS) ch = '-';
+        if (ch != 0) {
+            if (app->edit_first_key) { app->edit_len = 0; app->edit_buf[0] = '\0'; app->edit_first_key = false; }
+            if (app->edit_len < 20) { app->edit_buf[app->edit_len++] = ch; app->edit_buf[app->edit_len] = '\0'; }
+            return true;
+        }
+        /* Arrow key commits current edit and moves immediately! */
+        if (k == KEY_UP || k == KEY_DOWN || k == KEY_LEFT || k == KEY_RIGHT) {
+            commit_inline_edit(app);
+        } else {
+            return true;
+        }
     }
 
+    /* 2) Direct digit typing on any editable screen starts inline edit immediately! */
+    if (app->screen != SCR_HOME && app->screen != SCR_MECH &&
+        app->screen != SCR_REF_GRAPHS && app->screen != SCR_THEORY) {
+        char ch = key_to_numchar(k);
+        if (ch != 0) {
+            bool dummy = false;
+            if (get_active_field_ptr(app, &dummy) != NULL) {
+                begin_inline_edit(app, ch);
+                return true;
+            }
+        }
+    }
+
+    /* 3) Home Menu (Row List 1-7) */
     if (app->screen == SCR_HOME) {
         if (k == KEY_CLEAR) return false;
-        if (k == KEY_LEFT  && app->home_sel % 3 > 0) app->home_sel--;
-        if (k == KEY_RIGHT && app->home_sel % 3 < 2) app->home_sel++;
-        if (k == KEY_UP    && app->home_sel >= 3) app->home_sel -= 3;
-        if (k == KEY_DOWN  && app->home_sel < 3)  app->home_sel += 3;
-        if (k >= KEY_1 && k <= KEY_6) { app->home_sel = (int)(k - KEY_1); k = KEY_ENTER; }
-        if (k == KEY_ENTER) {
+        if (k == KEY_UP   && app->home_sel > 0) app->home_sel--;
+        if (k == KEY_DOWN && app->home_sel < 6) app->home_sel++;
+        if (k >= KEY_1 && k <= KEY_7) { app->home_sel = (int)(k - KEY_1); k = KEY_ENTER; }
+        if (k == KEY_F1 || k == KEY_ENTER) {
             app->screen = (ScreenId)(app->home_sel + 1);
             app->sub_mode = 0; app->cursor_r = 0; app->cursor_c = 0;
+            app->mech_editing = false; app->theory_list = true;
+            return true;
         }
+        if (k == KEY_F2) { app->screen = SCR_RATES; app->sub_mode = 0; app->cursor_r = 0; return true; }
+        if (k == KEY_F3) { app->screen = SCR_INIT_RATES; app->sub_mode = 0; app->cursor_r = 0; app->cursor_c = 0; return true; }
+        if (k == KEY_F4) { app->screen = SCR_REF_GRAPHS; app->ref_page = 0; return true; }
+        if (k == KEY_F5) { app->screen = SCR_THEORY; app->theory_list = true; return true; }
         return true;
     }
 
-    if (k == KEY_CLEAR) {
-        if (app->screen == SCR_INIT_RATES && app->sub_mode == 1) { app->sub_mode = 0; return true; }
-        app->screen = SCR_HOME;
-        return true;
-    }
-
+    /* 4) Screen-specific contextual softkeys & navigation */
     if (app->screen == SCR_RATES) {
-        if (k == KEY_MODE) { app->sub_mode = (app->sub_mode + 1) % 3; app->cursor_r = 0; }
-        else if (app->sub_mode == 0) {
+        if (k == KEY_F5 || k == KEY_CLEAR) { app->screen = SCR_HOME; return true; }
+        if (k == KEY_F2) { app->sub_mode = 0; app->cursor_r = 0; return true; }
+        if (k == KEY_F3) { app->sub_mode = 1; app->cursor_r = 0; app->cursor_c = 0; return true; }
+        if (k == KEY_F4) { app->sub_mode = 2; app->cursor_r = 0; return true; }
+        if (app->sub_mode == 0) {
+            if (k == KEY_F1) { app->rates.is_reactant = !app->rates.is_reactant; kinetics_rate_calc(&app->rates); }
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
             if (k == KEY_DOWN && app->cursor_r < 4) app->cursor_r++;
-            if (k == KEY_APPS) { app->rates.is_reactant = !app->rates.is_reactant; kinetics_rate_calc(&app->rates); }
-            if (k == KEY_ENTER) {
-                double *ptr[5] = { &app->rates.c1, &app->rates.c2, &app->rates.t1, &app->rates.t2, &app->rates.coeff };
-                const char *pr[5] = { "Edit [A]1 (M)", "Edit [A]2 (M)", "Edit t1 (s)", "Edit t2 (s)", "Edit Coeff a" };
-                if (ui_edit_double(pr[app->cursor_r], ptr[app->cursor_r])) kinetics_rate_calc(&app->rates);
-            }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else if (app->sub_mode == 1) {
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
             if (k == KEY_DOWN && app->cursor_r < 2) app->cursor_r++;
-            if (k == KEY_ENTER) {
-                if (ui_edit_double("Edit Coefficient", &app->stoich.coeffs[app->cursor_r]))
-                    kinetics_stoich_rates(&app->stoich);
-            }
-            if (k == KEY_APPS) {
-                app->stoich.known_idx = app->cursor_r;
-                if (ui_edit_double("Known Species Rate", &app->stoich.known_rate))
-                    kinetics_stoich_rates(&app->stoich);
-            }
+            if (k == KEY_LEFT) app->cursor_c = 0;
+            if (k == KEY_RIGHT) app->cursor_c = 1;
+            if (k == KEY_F1) kinetics_stoich_rates(&app->stoich);
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else {
             if (k == KEY_LEFT)  app->k_unit_order -= 0.5;
-            if (k == KEY_RIGHT) app->k_unit_order += 0.5;
-            if (k == KEY_ENTER) ui_edit_double("Overall Order n", &app->k_unit_order);
+            if (k == KEY_RIGHT || k == KEY_F1) app->k_unit_order += 0.5;
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         }
     } else if (app->screen == SCR_INIT_RATES) {
         InitialRatesState *ir = &app->init_rates;
+        if (k == KEY_F5) { app->screen = SCR_HOME; return true; }
         if (app->sub_mode == 0) {
+            if (k == KEY_CLEAR) { app->screen = SCR_HOME; return true; }
             int cols = ir->num_reactants + 1;
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
             if (k == KEY_DOWN && app->cursor_r < ir->num_rows - 1) app->cursor_r++;
             if (k == KEY_LEFT && app->cursor_c > 0) app->cursor_c--;
             if (k == KEY_RIGHT && app->cursor_c < cols - 1) app->cursor_c++;
-            if (k == KEY_PLUS && ir->num_rows < MAX_IR_ROWS) {
+            if (k == KEY_F1 || k == KEY_APPS) { kinetics_solve_initial_rates(ir); app->sub_mode = 1; app->step_idx = 0; app->cursor_c = 0; }
+            if ((k == KEY_F2 || k == KEY_PLUS) && ir->num_rows < MAX_IR_ROWS) {
                 int nr = ir->num_rows++;
                 for (int j = 0; j < MAX_IR_REACT; j++) ir->conc[nr][j] = ir->conc[nr - 1][j];
                 ir->rate[nr] = ir->rate[nr - 1];
+                kinetics_solve_initial_rates(ir);
             }
-            if (k == KEY_MINUS && ir->num_rows > 2) {
+            if ((k == KEY_F3 || k == KEY_MINUS) && ir->num_rows > 2) {
                 ir->num_rows--;
                 if (app->cursor_r >= ir->num_rows) app->cursor_r = ir->num_rows - 1;
+                kinetics_solve_initial_rates(ir);
             }
-            if (k == KEY_MODE) {
+            if (k == KEY_F4 || k == KEY_MODE) {
                 ir->num_reactants = (ir->num_reactants % 3) + 1;
                 if (app->cursor_c > ir->num_reactants) app->cursor_c = ir->num_reactants;
-            }
-            if (k == KEY_ENTER) {
-                double *target = (app->cursor_c < ir->num_reactants)
-                                 ? &ir->conc[app->cursor_r][app->cursor_c]
-                                 : &ir->rate[app->cursor_r];
-                ui_edit_double("Edit Table Cell", target);
-            }
-            if (k == KEY_APPS) {
                 kinetics_solve_initial_rates(ir);
-                app->sub_mode = 1;
-                app->step_idx = 0;
             }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else {
-            if (k == KEY_UP && app->step_idx > 0) app->step_idx--;
-            if (k == KEY_DOWN && app->step_idx < 2) app->step_idx++;
-            if (k == KEY_ENTER) {
-                const char *pr[3] = { "Predict at [A] (M)", "Predict at [B] (M)", "Predict at [C] (M)" };
-                for (int j = 0; j < ir->num_reactants; j++) {
-                    if (!ui_edit_double(pr[j], &ir->pred_conc[j])) break;
-                }
-                kinetics_solve_initial_rates(ir);
-                app->step_idx = 2;
+            if (k == KEY_CLEAR || k == KEY_F1) { app->sub_mode = 0; return true; }
+            if ((k == KEY_UP || k == KEY_F2) && app->step_idx > 0) app->step_idx--;
+            if ((k == KEY_DOWN || k == KEY_F3) && app->step_idx < 2) app->step_idx++;
+            if (app->step_idx == 2) {
+                if (k == KEY_LEFT && app->cursor_c > 0) app->cursor_c--;
+                if (k == KEY_RIGHT && app->cursor_c < ir->num_reactants - 1) app->cursor_c++;
+                if (k == KEY_ENTER || k == KEY_F4) begin_inline_edit(app, 0);
+            } else if (k == KEY_F4) {
+                app->step_idx = 2; app->cursor_c = 0; begin_inline_edit(app, 0);
             }
         }
     } else if (app->screen == SCR_INTEGRATED) {
-        if (k == KEY_MODE) { app->sub_mode = (app->sub_mode + 1) % 4; app->cursor_r = 0; }
-        else if (app->sub_mode == 0 && k == KEY_APPS) { app->sub_mode = 2; app->cursor_r = 0; app->cursor_c = 0; }
-        else if (app->sub_mode == 1) {
+        if (k == KEY_F5 || k == KEY_CLEAR) { app->screen = SCR_HOME; return true; }
+        if (k == KEY_F1) { app->sub_mode = 0; app->cursor_r = 0; return true; }
+        if (k == KEY_F2) { app->sub_mode = 1; app->cursor_r = 0; return true; }
+        if (k == KEY_F3) { app->sub_mode = 2; app->cursor_r = 0; app->cursor_c = 0; return true; }
+        if (k == KEY_F4) { app->sub_mode = 3; app->cursor_r = 0; return true; }
+        if (app->sub_mode == 1) {
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
             if (k == KEY_DOWN && app->cursor_r < 3) app->cursor_r++;
             if (k == KEY_LEFT)  { app->int_eq.order = (app->int_eq.order + 3) % 4; kinetics_integrated_solve(&app->int_eq); }
             if (k == KEY_RIGHT) { app->int_eq.order = (app->int_eq.order + 1) % 4; kinetics_integrated_solve(&app->int_eq); }
             if (k == KEY_APPS)  { app->int_eq.unknown = app->cursor_r; kinetics_integrated_solve(&app->int_eq); }
-            if (k == KEY_ENTER) {
-                double *ptrs[4] = { &app->int_eq.A0, &app->int_eq.At, &app->int_eq.k, &app->int_eq.t };
-                if (ui_edit_double("Edit Value", ptrs[app->cursor_r])) kinetics_integrated_solve(&app->int_eq);
-            }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else if (app->sub_mode == 2) {
             IntegratedTableState *it = &app->int_table;
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
@@ -1208,8 +1325,7 @@ bool app_handle_key(AppState *app, int k_in) {
             if (k == KEY_RIGHT) app->cursor_c = 1;
             if (k == KEY_PLUS && it->num_rows < MAX_INT_ROWS) {
                 int r = it->num_rows++;
-                it->t[r] = it->t[r - 1] + 2.0;
-                it->c[r] = it->c[r - 1] * 0.5;
+                it->t[r] = it->t[r - 1] + 2.0; it->c[r] = it->c[r - 1] * 0.5;
                 kinetics_regress_order(it);
             }
             if (k == KEY_MINUS && it->num_rows > 3) {
@@ -1217,97 +1333,138 @@ bool app_handle_key(AppState *app, int k_in) {
                 if (app->cursor_r >= it->num_rows) app->cursor_r = it->num_rows - 1;
                 kinetics_regress_order(it);
             }
-            if (k == KEY_ENTER) {
-                double *tptr = (app->cursor_c == 0) ? &it->t[app->cursor_r] : &it->c[app->cursor_r];
-                if (ui_edit_double(app->cursor_c == 0 ? "Edit Time t" : "Edit [A]", tptr))
-                    kinetics_regress_order(it);
-            }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else if (app->sub_mode == 3) {
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
             if (k == KEY_DOWN && app->cursor_r < 2) app->cursor_r++;
-            if (k == KEY_ENTER) {
-                double *ptrs[3] = { &app->pseudo_kp, &app->pseudo_excess, &app->pseudo_order };
-                ui_edit_double("Edit Pseudo Val", ptrs[app->cursor_r]);
-            }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         }
     } else if (app->screen == SCR_MECH) {
+        if (k == KEY_F5) { app->mech_editing = false; app->screen = SCR_HOME; return true; }
+        if (app->mech_editing) {
+            MechStep *st = &app->mech.steps[app->cursor_r];
+            if (k == KEY_CLEAR || k == KEY_ENTER || k == KEY_F1) {
+                app->mech_editing = false; kinetics_analyze_mech(&app->mech); return true;
+            }
+            if (k == KEY_UP && app->mech_field > 0) app->mech_field--;
+            if (k == KEY_DOWN && app->mech_field < 4) app->mech_field++;
+            if (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_F2 || k == KEY_F3) {
+                int d = (k == KEY_RIGHT || k == KEY_F3) ? 1 : -1;
+                if (app->mech_field == 4) {
+                    st->speed = (StepSpeed)(((int)st->speed + 3 + d) % 3);
+                } else {
+                    int is_p = (app->mech_field >= 2);
+                    int slot = app->mech_field % 2;
+                    int *cnt = is_p ? &st->n_prod : &st->n_react;
+                    MechTerm *arr = is_p ? st->prod : st->react;
+                    int cur_id = (slot < *cnt) ? find_pool_idx(arr[slot].formula) : 0;
+                    int nid = (cur_id + NUM_SPECIES_POOL + d) % NUM_SPECIES_POOL;
+                    if (nid == 0) {
+                        if (slot == 0 && *cnt == 2) { arr[0] = arr[1]; *cnt = 1; }
+                        else if (slot < *cnt) *cnt = slot;
+                    } else {
+                        if (slot >= *cnt) { *cnt = slot + 1; arr[slot].coeff = 1; }
+                        strcpy(arr[slot].formula, SPECIES_POOL[nid]);
+                    }
+                }
+                kinetics_analyze_mech(&app->mech);
+            }
+            if (k == KEY_PLUS || k == KEY_MINUS || k == KEY_F4) {
+                int d = (k == KEY_MINUS) ? -1 : 1;
+                if (app->mech_field < 4) {
+                    int is_p = (app->mech_field >= 2);
+                    int slot = app->mech_field % 2;
+                    int cnt = is_p ? st->n_prod : st->n_react;
+                    MechTerm *arr = is_p ? st->prod : st->react;
+                    if (slot < cnt) {
+                        arr[slot].coeff = ((arr[slot].coeff - 1 + 3 + d) % 3) + 1;
+                        kinetics_analyze_mech(&app->mech);
+                    }
+                }
+            }
+            return true;
+        }
+        if (k == KEY_CLEAR) { app->screen = SCR_HOME; return true; }
         if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
         if (k == KEY_DOWN && app->cursor_r < app->mech.num_steps - 1) app->cursor_r++;
-        if (k == KEY_LEFT || k == KEY_RIGHT) {
-            int d = (k == KEY_RIGHT) ? 1 : -1;
+        if (k == KEY_ENTER || k == KEY_F1) { app->mech_editing = true; app->mech_field = 0; }
+        if (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_F2) {
+            int d = (k == KEY_LEFT) ? -1 : 1;
             MechStep *st = &app->mech.steps[app->cursor_r];
             st->speed = (StepSpeed)(((int)st->speed + 3 + d) % 3);
             kinetics_analyze_mech(&app->mech);
         }
-        if (k == KEY_PLUS && app->mech.num_steps < 3) {
-            app->mech.num_steps = 3;
-            MechStep *st = &app->mech.steps[2];
-            st->speed = STEP_FAST; st->n_react = 1; st->n_prod = 1;
-            strcpy(st->react[0].formula, "I1"); st->react[0].coeff = 1;
-            strcpy(st->prod[0].formula, "C");   st->prod[0].coeff = 1;
+        if (k == KEY_F3 || k == KEY_PLUS || k == KEY_MINUS) {
+            if (app->mech.num_steps == 2 && k != KEY_MINUS) {
+                app->mech.num_steps = 3;
+                MechStep *st = &app->mech.steps[2];
+                st->speed = STEP_FAST; st->n_react = 1; st->n_prod = 1;
+                strcpy(st->react[0].formula, "I1"); st->react[0].coeff = 1;
+                strcpy(st->prod[0].formula, "C");   st->prod[0].coeff = 1;
+            } else if (app->mech.num_steps == 3 && k != KEY_PLUS) {
+                app->mech.num_steps = 2;
+                if (app->cursor_r >= 2) app->cursor_r = 1;
+            }
             kinetics_analyze_mech(&app->mech);
         }
-        if (k == KEY_MINUS && app->mech.num_steps > 2) {
-            app->mech.num_steps = 2;
-            if (app->cursor_r >= 2) app->cursor_r = 1;
-            kinetics_analyze_mech(&app->mech);
-        }
-        if (k == KEY_ENTER) {
-            ui_edit_mech_step(&app->mech.steps[app->cursor_r], app->cursor_r);
-            kinetics_analyze_mech(&app->mech);
-        }
-        if (k == KEY_MODE) {
-            app_load_mech_preset(app, (app->mech_preset + 1) % 5);
-            app->cursor_r = 0;
-        }
+        if (k == KEY_F4 || k == KEY_MODE) { app_load_mech_preset(app, (app->mech_preset + 1) % 5); app->cursor_r = 0; }
     } else if (app->screen == SCR_ARRHENIUS) {
-        if (k == KEY_MODE) { app->sub_mode = (app->sub_mode + 1) % 3; app->cursor_r = 0; }
-        else if (app->sub_mode == 0) {
+        if (k == KEY_F5 || k == KEY_CLEAR) { app->screen = SCR_HOME; return true; }
+        if (k == KEY_F1) { app->sub_mode = 0; app->cursor_r = 0; return true; }
+        if (k == KEY_F2) { app->sub_mode = 1; app->cursor_r = 0; app->cursor_c = 0; return true; }
+        if (k == KEY_F3) { app->sub_mode = 2; app->cursor_r = 0; return true; }
+        if (app->sub_mode == 0) {
             if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
             if (k == KEY_DOWN && app->cursor_r < 4) app->cursor_r++;
-            if (k == KEY_LEFT || k == KEY_RIGHT) app->arrh_celsius = !app->arrh_celsius;
+            if (k == KEY_F4 || k == KEY_LEFT || k == KEY_RIGHT) app->arrh_celsius = !app->arrh_celsius;
             if (k == KEY_APPS) { app->arrh2.unknown = app->cursor_r; kinetics_arrhenius_2pt(&app->arrh2); }
-            if (k == KEY_ENTER) {
-                if (app->cursor_r == 2 || app->cursor_r == 4) {
-                    double *tk = (app->cursor_r == 2) ? &app->arrh2.T2 : &app->arrh2.T1;
-                    double disp = app->arrh_celsius ? (*tk - 273.15) : *tk;
-                    if (ui_edit_double(app->arrh_celsius ? "Temp (deg C)" : "Temp (K)", &disp)) {
-                        *tk = app->arrh_celsius ? (disp + 273.15) : disp;
-                        kinetics_arrhenius_2pt(&app->arrh2);
-                    }
-                } else {
-                    double *ptrs[5] = { &app->arrh2.Ea_kj, &app->arrh2.k2, &app->arrh2.T2, &app->arrh2.k1, &app->arrh2.T1 };
-                    if (ui_edit_double("Edit Arrhenius Val", ptrs[app->cursor_r])) kinetics_arrhenius_2pt(&app->arrh2);
-                }
-            }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else if (app->sub_mode == 1) {
-            ArrhTableState *at = &app->arrh_tbl;
-            if (k == KEY_APPS) {
-                if (ui_edit_double("Evaluate k at T (K)", &at->eval_T)) kinetics_arrhenius_regress(at);
-            }
-            if (k == KEY_ENTER) {
-                for (int i = 0; i < at->num_rows; i++) {
-                    char pt[24], pk[24];
-                    snprintf(pt, sizeof(pt), "Pt %d Temp (K)", i + 1);
-                    snprintf(pk, sizeof(pk), "Pt %d Rate k", i + 1);
-                    if (!ui_edit_double(pt, &at->T[i])) break;
-                    if (!ui_edit_double(pk, &at->k[i])) break;
-                }
-                kinetics_arrhenius_regress(at);
-            }
+            if (k == KEY_UP && app->cursor_r > 0) app->cursor_r--;
+            if (k == KEY_DOWN && app->cursor_r < 2) app->cursor_r++;
+            if (k == KEY_LEFT) app->cursor_c = 0;
+            if (k == KEY_RIGHT) app->cursor_c = 1;
+            if (k == KEY_F4) { app->cursor_r = 3; begin_inline_edit(app, 0); }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         } else {
-            if (k == KEY_ENTER) {
-                if (ui_edit_double("Uncatalyzed Ea (kJ)", &app->cat.Ea_uncat_kj)) {
-                    ui_edit_double("Catalyzed Ea (kJ)", &app->cat.Ea_cat_kj);
-                    ui_edit_double("Delta E (kJ, -exo)", &app->cat.delta_E_kj);
-                    ui_edit_double("Temp T (K)", &app->cat.T_kelvin);
-                    kinetics_catalyst_calc(&app->cat);
-                }
+            if (k == KEY_UP && app->cursor_r >= 2) app->cursor_r -= 2;
+            if (k == KEY_DOWN && app->cursor_r < 2) app->cursor_r += 2;
+            if (k == KEY_LEFT && (app->cursor_r % 2) == 1) app->cursor_r--;
+            if (k == KEY_RIGHT && (app->cursor_r % 2) == 0) app->cursor_r++;
+            if (k == KEY_F4) {
+                app->cat.Ea_uncat_kj = 125.0; app->cat.Ea_cat_kj = 85.0;
+                app->cat.delta_E_kj = -216.0; app->cat.T_kelvin = 298.0;
+                kinetics_catalyst_calc(&app->cat);
             }
+            if (k == KEY_ENTER) begin_inline_edit(app, 0);
         }
-    } else if (app->screen == SCR_SUMMARY) {
-        if (k == KEY_LEFT)  app->ref_page = (app->ref_page + 4) % 5;
-        if (k == KEY_RIGHT) app->ref_page = (app->ref_page + 1) % 5;
+    } else if (app->screen == SCR_REF_GRAPHS) {
+        if (k == KEY_F5 || k == KEY_CLEAR) { app->screen = SCR_HOME; return true; }
+        if (k == KEY_F1) app->ref_page = 0;
+        if (k == KEY_F2) app->ref_page = 1;
+        if (k == KEY_F3) app->ref_page = 2;
+        if (k == KEY_F4) app->ref_page = 3;
+        if (k == KEY_LEFT)  app->ref_page = (app->ref_page + 3) % 4;
+        if (k == KEY_RIGHT) app->ref_page = (app->ref_page + 1) % 4;
+    } else if (app->screen == SCR_THEORY) {
+        if (app->theory_list) {
+            if (k == KEY_CLEAR || k == KEY_F5) { app->screen = SCR_HOME; return true; }
+            if (k == KEY_UP && app->theory_idx > 0) app->theory_idx--;
+            if (k == KEY_DOWN && app->theory_idx < NUM_THEORIES - 1) app->theory_idx++;
+            if (k == KEY_ENTER || k == KEY_F1) { app->theory_list = false; app->theory_tab = 0; }
+            if (k == KEY_F2) { app->theory_list = false; app->theory_tab = 0; }
+            if (k == KEY_F3) { app->theory_list = false; app->theory_tab = 1; }
+            if (k == KEY_F4) { app->theory_list = false; app->theory_tab = 2; }
+        } else {
+            if (k == KEY_CLEAR || k == KEY_F1) { app->theory_list = true; return true; }
+            if (k == KEY_F2) app->theory_tab = 0;
+            if (k == KEY_F3) app->theory_tab = 1;
+            if (k == KEY_F4) app->theory_tab = 2;
+            if (k == KEY_LEFT)  app->theory_tab = (app->theory_tab + 2) % 3;
+            if (k == KEY_RIGHT) app->theory_tab = (app->theory_tab + 1) % 3;
+            if (k == KEY_UP && app->theory_idx > 0) { app->theory_idx--; app->theory_tab = 0; }
+            if (k == KEY_DOWN || k == KEY_F5) { app->theory_idx = (app->theory_idx + 1) % NUM_THEORIES; app->theory_tab = 0; }
+        }
     }
     return true;
 }
